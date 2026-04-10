@@ -2,149 +2,195 @@ import torch
 import torch.nn as nn
 import torchvision
 import torchvision.transforms as transforms
-from DTU_ADLCV_attention_surgeon_grp10.utils import load_model
+from utils import load_model  # Adjusted import to your structure
 from torch.utils.data import DataLoader
 import torch.optim as optim
 from tqdm.auto import tqdm
 import matplotlib.pyplot as plt
 import os
+import argparse
 
-'''
-Done:
-- Open a dataset (CIFAR-10)
-- Linear Probing for Classification task:
-    * Model created (Dinov2 frozen + Linear head for classification)
-    * Training the head on CIFAR-10 TODO : CLEAN TRAINING with loss function etc
-    * Retrieve the 144 heads loacted by 0-11 blocks of attention with each attn.num_heads=12 (need to reshaape the weights of the qkv tensor) (Look at Hook of Dinov2)
 
-TODO:
-- Download ImageNet-1k ? Look at Dino with registers
-- Once trained, plot head activation (4 methods) while prediction (average attention entropy/ average attention distance / head importance via gradient-based attribution / activation magnitude)
-- First Pruning with mask but then find a solution for dynamic physical pruning (Gate ?)
+class DinoClassifier(nn.Module):
+    """
+    Linear probing model: Frozen DINOv2 backbone + Trainable Linear Head.
+    """
 
-'''
+    def __init__(self, device, num_classes=10):
+        super(DinoClassifier, self).__init__()
+        self.transformer = load_model(device)
 
-def main():
-    #-------------------DATASET
-    base_transform = transforms.Compose([
-        transforms.Resize(224),
-        transforms.ToTensor(),
-        transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
-    ])
+        # Freeze the backbone for linear probing [cite: 40, 44]
+        for param in self.transformer.parameters():
+            param.requires_grad = False
 
-    train_set = torchvision.datasets.CIFAR10(
-        root='./data', 
-        train=True, 
-        download=True, 
-        transform=base_transform
+        self.classifier = nn.Linear(768, num_classes)
+
+    def forward(self, x):
+        # DINOv2 returns the CLS token by default in this configuration
+        features = self.transformer(x)
+        logits = self.classifier(features)
+        return logits
+
+
+def train_one_epoch(model, loader, criterion, optimizer, device):
+    model.train()
+    running_loss = 0.0
+    for images, labels in tqdm(loader, desc="Training", leave=False):
+        images, labels = images.to(device), labels.to(device)
+
+        outputs = model(images)
+        loss = criterion(outputs, labels)
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        running_loss += loss.item()
+    return running_loss / len(loader)
+
+
+def validate(model, loader, criterion, device):
+    model.eval()
+    running_loss = 0.0
+    correct = 0
+    total = 0
+    with torch.no_grad():
+        for images, labels in tqdm(loader, desc="Validating", leave=False):
+            images, labels = images.to(device), labels.to(device)
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+            running_loss += loss.item()
+
+            _, predicted = outputs.max(1)
+            total += labels.size(0)
+            correct += predicted.eq(labels).sum().item()
+
+    accuracy = 100.0 * correct / total
+    return running_loss / len(loader), accuracy
+
+
+def get_loaders(data_dir, batch_size, num_workers):
+    base_transform = transforms.Compose(
+        [
+            transforms.Resize(224),
+            transforms.ToTensor(),
+            transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
+        ]
     )
-
+    train_set = torchvision.datasets.CIFAR10(
+        root=data_dir, train=True, download=True, transform=base_transform
+    )
     test_set = torchvision.datasets.CIFAR10(
-        root='./data', 
-        train=False, 
-        download=True, 
-        transform=base_transform
+        root=data_dir, train=False, download=True, transform=base_transform
     )
 
     train_loader = DataLoader(
-        train_set, 
-        batch_size=32, 
-        shuffle=True, 
-        num_workers=2
+        train_set, batch_size=batch_size, shuffle=True, num_workers=num_workers
     )
-
     test_loader = DataLoader(
-        test_set, 
-        batch_size=32, 
-        shuffle=False, 
-        num_workers=2
+        test_set, batch_size=batch_size, shuffle=False, num_workers=num_workers
+    )
+    return train_loader, test_loader
+
+
+def main(args):
+    device = (
+        args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu")
+    )
+    print(f"Using device: {device}")
+
+    # ------------------- DATASET SETUP
+    base_transform = transforms.Compose(
+        [
+            transforms.Resize(224),
+            transforms.ToTensor(),
+            transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
+        ]
     )
 
-    print(f"Images d'entraînement : {len(train_set)}") # 50000
-    print(f"Images de test : {len(test_set)}") # 10000
+    train_loader, test_loader = get_loaders(
+        args.data_dir, args.batch_size, args.num_workers
+    )
 
-    classes = ('plane', 'car', 'bird', 'cat', 'deer', 'dog', 'frog', 'horse', 'ship', 'truck')
-    print(f"{classes=}")
+    # ------------------- MODEL SETUP
+    model = DinoClassifier(device, num_classes=10).to(device)
+    os.makedirs(args.checkpoint_dir, exist_ok=True)
 
-    #-------------------Linear Probing
-    class DinoClassifier(nn.Module):
-        def __init__(self, num_classes=10):
-            super(DinoClassifier, self).__init__()
-            self.transformer = load_model(device)
-            
-            for param in self.transformer.parameters():
-                param.requires_grad = False
-
-            self.classifier = nn.Linear(768, num_classes)
-
-        def forward(self, x):
-            features = self.transformer(x)
-            logits = self.classifier(features)
-            return logits
-
-    model = DinoClassifier(num_classes=10).to(device)
-    # For saving the checkpoints
-    os.makedirs("checkpoints", exist_ok=True)
-
-    #---------------Training Linear Probing (Comment this piece if weights saved)
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.classifier.parameters(), lr=1e-3) # we train only the head
+    optimizer = optim.Adam(model.classifier.parameters(), lr=args.lr)
 
-    train_losses = []
-    val_losses = []
-    for epoch in range(num_epochs): 
-        train_loss = 0.
-        val_loss = 0.
-        
-        # Train
-        model.train()
-        for images, labels in tqdm(train_loader, total=len(train_loader), desc=f"Epoch {epoch+1}/{num_epochs} [Train]"):
-            images, labels = images.to(device), labels.to(device)
-            
-            outputs = model(images)
-            loss = criterion(outputs, labels)
-            train_loss += loss.item()
-            
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-        train_losses.append(train_loss/len(train_loader))
+    train_losses, val_losses = [], []
 
-        # Val
-        model.eval()
-        with torch.no_grad():
-            for images, labels in tqdm(test_loader, total=len(test_loader), desc=f"Epoch {epoch+1}/{num_epochs} [Val]"):
-                images, labels = images.to(device), labels.to(device)
-                
-                outputs = model(images)
-                loss = criterion(outputs, labels)
-                val_loss += loss.item()
-            
-        val_losses.append(val_loss/len(test_loader))
-        checkpoint_path = f"checkpoints/dino_classifier_epoch_{epoch+1}.pth"
-    
-        torch.save({
-            'epoch': epoch + 1,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'train_loss': train_losses[-1],
-            'val_loss': val_losses[-1],
-        }, checkpoint_path)
-        
-        print(f"Checkpoint sauvé : {checkpoint_path}")
+    # ------------------- TRAINING LOOP
+    for epoch in range(args.epochs):
+        t_loss = train_one_epoch(model, train_loader, criterion, optimizer, device)
+        v_loss, v_acc = validate(model, test_loader, criterion, device)
 
-    # Plot Train/val curves
+        train_losses.append(t_loss)
+        val_losses.append(v_loss)
+
+        print(
+            f"Epoch {epoch+1}/{args.epochs} | Train Loss: {t_loss:.4f} | Val Loss: {v_loss:.4f} | Val Acc: {v_acc:.2f}%"
+        )
+
+        # Save Checkpoint
+        checkpoint_path = os.path.join(
+            args.checkpoint_dir, f"dino_classifier_latest.pth"
+        )
+        torch.save(
+            {
+                "epoch": epoch + 1,
+                "model_state_dict": model.state_dict(),
+                "val_acc": v_acc,
+            },
+            checkpoint_path,
+        )
+
+    # ------------------- VISUALIZATION
     os.makedirs("figure", exist_ok=True)
-    plt.plot(range(1, num_epochs + 1), train_losses, label="train", marker = 'o')
-    plt.plot(range(1, num_epochs + 1), val_losses, label = "val", marker = 's')
+    plt.figure(figsize=(10, 5))
+    plt.plot(range(1, args.epochs + 1), train_losses, label="Train Loss")
+    plt.plot(range(1, args.epochs + 1), val_losses, label="Val Loss")
     plt.xlabel("Epoch")
-    plt.ylabel("Cross Entropy Loss")
+    plt.ylabel("Loss")
     plt.legend()
-    plt.savefig("figure/train_val_curve.jpg")
-    plt.close()
+    plt.savefig(os.path.join("figure", "train_val_curve.jpg"))
+    print("Training curve saved to figure/train_val_curve.jpg")
+
 
 if __name__ == "__main__":
-    #------------------HYPERPARAMETERS
-    device = "mps" if torch.backends.mps.is_available() else "cpu"
-    num_epochs = 30
-    main()
+    parser = argparse.ArgumentParser(
+        description="AttentionSurgeon: DINOv2 Linear Probing for Classification [cite: 31]"
+    )
+
+    # Path Arguments
+    parser.add_argument(
+        "--data_dir", type=str, default="./data", help="Path to dataset"
+    )
+    parser.add_argument(
+        "--checkpoint_dir",
+        type=str,
+        default="./checkpoints",
+        help="Path to save weights",
+    )
+
+    # Hyperparameters
+    parser.add_argument(
+        "--epochs", type=int, default=30, help="Number of training epochs"
+    )
+    parser.add_argument(
+        "--batch_size", type=int, default=32, help="Batch size for training"
+    )
+    parser.add_argument(
+        "--lr", type=float, default=1e-3, help="Learning rate for linear head"
+    )
+
+    # Hardware
+    parser.add_argument(
+        "--device", type=str, default=None, help="Force device (e.g., cuda, mps, cpu)"
+    )
+    parser.add_argument("--num_workers", type=int, default=2, help="DataLoader workers")
+
+    args = parser.parse_args()
+    main(args)
