@@ -22,39 +22,38 @@ from classification import DinoClassifier, get_loaders
 def compute_entropy(attn_map):
     """
     Computes average attention entropy: -sum(p * log(p)).
-    High entropy = diffuse attention; Low entropy = focused attention.
-    attn_map shape: (batch, heads, query_tokens, key_tokens)
+    attn_map shape: (B, H, N, N)
     """
-    # Add epsilon to avoid log(0)
-    entropy = -torch.sum(attn_map * torch.log(attn_map + 1e-8), dim=-1)
-    return entropy.mean(dim=(0, 2))  # Mean over batch and query tokens
+    # Sum over the last dimension (key tokens)
+    entropy = -torch.sum(
+        attn_map * torch.log(attn_map + 1e-8), dim=-1
+    )  # Shape: (B, H, N)
+    return entropy.mean(dim=(0, 2))  # Mean over Batch and Query tokens -> Shape: (H,)
 
 
 def compute_distance(attn_map, grid_size=16):
     """
-    Computes average attention distance (local vs. global).
-    grid_size: 16 for DINOv2 ViT-B/14 (approx 16x16 patches for 224x224)
+    Computes average attention distance (Task 1b).
+    DINOv2 ViT-B/14 on 224x224 images has 16x16 patches.
     """
-    # Create coordinate grid for patches
-    x = torch.arange(grid_size)
-    y = torch.arange(grid_size)
-    grid_x, grid_y = torch.meshgrid(x, y, indexing="ij")
-    coords = (
-        torch.stack([grid_x.flatten(), grid_y.flatten()], dim=1)
-        .float()
-        .to(attn_map.device)
-    )
+    device = attn_map.device
+    # Create coordinate grid
+    x = torch.arange(grid_size, device=device)
+    y = torch.arange(grid_size, device=device)
+    grid_y, grid_x = torch.meshgrid(y, x, indexing="ij")
+    coords = torch.stack(
+        [grid_x.flatten(), grid_y.flatten()], dim=1
+    ).float()  # (256, 2)
 
-    # Calculate pairwise Euclidean distances between all patches
-    # dists shape: (num_patches, num_patches)
-    dists = torch.cdist(coords, coords, p=2)
+    # Pairwise Euclidean distances
+    dists = torch.cdist(coords, coords, p=2)  # (256, 256)
 
-    # Exclude CLS token if present (DINOv2 has 1 CLS token + patches)
-    # attn_map shape usually: (B, H, N, N) where N = patches + 1
-    attn_patches = attn_map[:, :, 1:, 1:]
+    # DINOv2 has 1 CLS token + 256 patches. We extract patch-to-patch attention.
+    attn_patches = attn_map[:, :, 1:, 1:]  # (B, H, 256, 256)
 
-    avg_dist = torch.sum(attn_patches * dists, dim=-1)
-    return avg_dist.mean(dim=(0, 2))
+    # Weighted average distance per head
+    avg_dist = torch.sum(attn_patches * dists, dim=-1)  # (B, H, 256)
+    return avg_dist.mean(dim=(0, 2))  # (H,)
 
 
 # ----------------- CENSUS RUNNER -----------------
@@ -64,65 +63,82 @@ class HeadCensus:
     def __init__(self, model, device):
         self.model = model
         self.device = device
+        self.num_layers = 12
+        self.num_heads = 12
+        self.head_dim = 768 // self.num_heads
+
         self.metrics = {
             "entropy": torch.zeros(12, 12).to(device),
             "distance": torch.zeros(12, 12).to(device),
             "importance": torch.zeros(12, 12).to(device),
             "magnitude": torch.zeros(12, 12).to(device),
         }
-        self.attn_weights = {}
-        self._register_hooks()
 
-    def _register_hooks(self):
-        def get_attn_hook(layer_idx):
-            def hook(module, input, output):
-                # DINOv2 returns a tuple or tensor depending on version
-                # Usually: (batch, heads, seq_len, seq_len)
-                self.attn_weights[layer_idx] = output
+    def get_attention_map(self, x, layer_idx):
+        """
+        Manually computes attention map for DINOv2 blocks (from your rl_utils.py logic).
+        """
+        block = self.model.transformer.blocks[layer_idx]
+        B, N, C = x.shape
 
-            return hook
+        # 1. Get QKV
+        qkv = (
+            block.attn.qkv(x)
+            .reshape(B, N, 3, self.num_heads, C // self.num_heads)
+            .permute(2, 0, 3, 1, 4)
+        )
+        q, k, v = qkv[0], qkv[1], qkv[2]
 
-        # DINOv2 ViT-B/14 architecture: model.transformer.blocks -> model.blocks
-        for i in range(12):
-            # Accessing the attention layer specifically
-            layer = self.model.transformer.blocks[i].attn
-            layer.register_forward_hook(get_attn_hook(i))
+        # 2. Compute Attention Matrix
+        attn = (q @ k.transpose(-2, -1)) * (self.head_dim**-0.5)
+        attn = attn.softmax(dim=-1)
+        return attn, v  # Return V for magnitude calculation
 
     def run_census(self, dataloader, num_batches=10):
         self.model.eval()
-        # We need gradients for "importance via gradient-based attribution"
         criterion = nn.CrossEntropyLoss()
 
-        for i, (images, labels) in enumerate(tqdm(dataloader, desc="Computing Census")):
-            if i >= num_batches:
+        for b_idx, (images, labels) in enumerate(tqdm(dataloader, desc="Census")):
+            if b_idx >= num_batches:
                 break
             images, labels = images.to(self.device), labels.to(self.device)
 
-            # Enable gradient for importance metric
+            # Forward pass through the backbone (manually to capture layers)
+            # We track gradients for 'importance' (Task 1c)
             images.requires_grad = True
-            outputs = self.model(images)
-            loss = criterion(outputs, labels)
 
+            # Step-by-step through transformer blocks
+            x = self.model.transformer.prepare_tokens_with_masks(images)
+
+            for i in range(self.num_layers):
+                attn_map, v_tokens = self.get_attention_map(x, i)
+
+                with torch.no_grad():
+                    # (a) Entropy
+                    self.metrics["entropy"][i] += compute_entropy(attn_map)
+                    # (b) Distance
+                    self.metrics["distance"][i] += compute_distance(attn_map)
+                    # (d) Magnitude (L2 norm of value tokens)
+                    self.metrics["magnitude"][i] += v_tokens.norm(p=2, dim=(0, 2, 3))
+
+                # Continue full forward pass for gradients
+                x = self.model.transformer.blocks[i](x)
+
+            # (c) Importance via Gradient Attribution
+            # We backward from the final classification loss
+            logits = self.model.classifier(self.model.transformer.norm(x[:, 0]))
+            loss = criterion(logits, labels)
             self.model.zero_grad()
             loss.backward()
 
             with torch.no_grad():
-                for layer_idx in range(12):
-                    attn = self.attn_weights[layer_idx]
-                    # Compute the 4 project metrics
-                    self.metrics["entropy"][layer_idx] += compute_entropy(attn)
-                    self.metrics["distance"][layer_idx] += compute_distance(attn)
-                    # Importance: simplified as gradient magnitude
-                    if hasattr(self.model.transformer.blocks[layer_idx].attn, "qkv"):
-                        grad = self.model.transformer.blocks[
-                            layer_idx
-                        ].attn.qkv.weight.grad
-                        self.metrics["importance"][layer_idx] += grad.norm(p=2)
-                    self.metrics["magnitude"][layer_idx] += attn.norm(
-                        p=2, dim=(0, 2, 3)
-                    )
+                for i in range(self.num_layers):
+                    # Importance based on gradient of QKV weights
+                    grad = self.model.transformer.blocks[i].attn.qkv.weight.grad
+                    if grad is not None:
+                        self.metrics["importance"][i] += grad.norm(p=2)
 
-        # Normalize across batches
+        # Normalize
         for key in self.metrics:
             self.metrics[key] /= num_batches
 
