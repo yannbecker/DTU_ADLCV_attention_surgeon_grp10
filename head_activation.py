@@ -14,8 +14,7 @@ import matplotlib.pyplot as plt
 import argparse
 import os
 from tqdm import tqdm
-from utils import load_model
-from classification import DinoClassifier  # Assuming this structure
+from classification import DinoClassifier, get_loaders
 
 # ----------------- METRIC FUNCTIONS -----------------
 
@@ -71,70 +70,59 @@ class HeadCensus:
             "importance": torch.zeros(12, 12).to(device),
             "magnitude": torch.zeros(12, 12).to(device),
         }
-        self.hooks = []
         self.attn_weights = {}
-        self.attn_grads = {}
         self._register_hooks()
 
     def _register_hooks(self):
         def get_attn_hook(layer_idx):
             def hook(module, input, output):
-                # DINOv2 attention returns (attn_map) if select_token is used
-                # This depends on your specific forward implementation
+                # DINOv2 returns a tuple or tensor depending on version
+                # Usually: (batch, heads, seq_len, seq_len)
                 self.attn_weights[layer_idx] = output
 
             return hook
 
-        def get_grad_hook(layer_idx):
-            def hook(grad):
-                self.attn_grads[layer_idx] = grad
-
-            return hook
-
-        # Accessing DINOv2 blocks
+        # DINOv2 ViT-B/14 architecture: model.transformer.blocks -> model.blocks
         for i in range(12):
-            # This hook path depends on the specific Timm/Facebook implementation of DINOv2
-            # For standard ViT: model.transformer.blocks[i].attn
+            # Accessing the attention layer specifically
             layer = self.model.transformer.blocks[i].attn
-            self.hooks.append(layer.register_forward_hook(get_attn_hook(i)))
+            layer.register_forward_hook(get_attn_hook(i))
 
     def run_census(self, dataloader, num_batches=10):
         self.model.eval()
+        # We need gradients for "importance via gradient-based attribution"
         criterion = nn.CrossEntropyLoss()
 
-        for i, (images, labels) in enumerate(
-            tqdm(dataloader, desc="Computing Metrics")
-        ):
+        for i, (images, labels) in enumerate(tqdm(dataloader, desc="Computing Census")):
             if i >= num_batches:
                 break
             images, labels = images.to(self.device), labels.to(self.device)
 
-            # For gradient-based importance, we need gradients
+            # Enable gradient for importance metric
             images.requires_grad = True
             outputs = self.model(images)
             loss = criterion(outputs, labels)
 
-            # Backward pass for importance (Task 1c)
             self.model.zero_grad()
             loss.backward()
 
             with torch.no_grad():
                 for layer_idx in range(12):
                     attn = self.attn_weights[layer_idx]
-
-                    # 1. Entropy
+                    # Compute the 4 project metrics
                     self.metrics["entropy"][layer_idx] += compute_entropy(attn)
-
-                    # 2. Distance
                     self.metrics["distance"][layer_idx] += compute_distance(attn)
-
-                    # 3. Magnitude (L2 norm of head activations)
-                    # Simplified: using mean of attention weights as proxy or hook output features
+                    # Importance: simplified as gradient magnitude
+                    if hasattr(self.model.transformer.blocks[layer_idx].attn, "qkv"):
+                        grad = self.model.transformer.blocks[
+                            layer_idx
+                        ].attn.qkv.weight.grad
+                        self.metrics["importance"][layer_idx] += grad.norm(p=2)
                     self.metrics["magnitude"][layer_idx] += attn.norm(
                         p=2, dim=(0, 2, 3)
                     )
 
-        # Normalize
+        # Normalize across batches
         for key in self.metrics:
             self.metrics[key] /= num_batches
 
@@ -167,32 +155,57 @@ def main():
         type=str,
         default="classification",
         choices=["classification", "detection", "segmentation"],
+        help="Downstream task to evaluate [cite: 40]",
     )
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument(
-        "--samples", type=int, default=10, help="Number of batches to process"
+        "--samples",
+        type=int,
+        default=10,
+        help="Number of batches to process for the census",
     )
-    args = parser.parse_args()
+    parser.add_argument(
+        "--data_dir",
+        type=str,
+        default="./data",
+        help="Directory containing the datasets",
+    )
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        default="checkpoints/dino_classifier_epoch_30.pth",
+        help="Path to the trained linear probe weights",
+    )
 
+    args = parser.parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Load Task-Specific Model
+    # Load Task-Specific Model and Dataloader
     if args.task == "classification":
-        from classification import train_loader  # Assuming data is exported
+        # Initialize the DINOv2-based classifier
+        model = DinoClassifier(device=device, num_classes=10).to(device)
 
-        model = DinoClassifier(num_classes=10).to(device)
-        # Load weights if trained
-        checkpoint = torch.load(
-            "checkpoints/dino_classifier_epoch_30.pth", map_location=device
-        )
-        model.load_state_dict(checkpoint["model_state_dict"])
-        dataloader = train_loader
+        # Load the trained linear probe weights
+        if os.path.exists(args.checkpoint):
+            checkpoint = torch.load(args.checkpoint, map_location=device)
+            model.load_state_dict(checkpoint["model_state_dict"])
+            print(f"Loaded weights from {args.checkpoint}")
+        else:
+            print(
+                f"Warning: Checkpoint {args.checkpoint} not found. Running with random head."
+            )
+
+        # Retrieve loaders using the helper from classification.py
+        dataloader, _ = get_loaders(args.data_dir, args.batch_size, num_workers=2)
+
     else:
+        # Placeholder for Task 2 and 3 implementation
         print(
             f"Task {args.task} not yet implemented. Please create detection.py/segmentation.py"
         )
         return
 
+    # Execute Census and save visualizations
     census = HeadCensus(model, device)
     census.run_census(dataloader, num_batches=args.samples)
     census.plot_results(args.task)
