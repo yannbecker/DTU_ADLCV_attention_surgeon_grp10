@@ -36,16 +36,17 @@ class DinoClassifier(nn.Module):
         Registers hooks to zero out head outputs during forward pass.
         ViT-B/14 has 768 dim / 12 heads = 64 dim per head.
         """
+
         def hook_fn(module, input, output, layer_idx):
             # The output of DINOv2 attention is (Batch, Tokens, 768)
             # We reshape the mask for this layer to (1, 1, 12, 1) -> (Batch, Tokens, Heads, HeadDim)
             # However, it's simpler to just zero out the 64-dim slices.
-            mask_layer = self.mask[layer_idx] # Shape: (12,)
-            
+            mask_layer = self.mask[layer_idx]  # Shape: (12,)
+
             # Create a 768-dim binary mask for this specific layer
             # Each '1' or '0' in mask_layer is expanded to 64 dimensions
             full_mask = mask_layer.repeat_interleave(64).to(output.device)
-            
+
             # Apply the mask to the output tensor
             return output * full_mask
 
@@ -57,7 +58,7 @@ class DinoClassifier(nn.Module):
         # Attach hooks to each of the 12 blocks [cite: 28]
         for i in range(12):
             # We hook the 'attn' layer's output
-            layer = self.model.transformer.blocks[i].attn
+            layer = self.transformer.blocks[i].attn
             # Use a closure to pass the layer index
             handle = layer.register_forward_hook(
                 lambda mod, inp, out, idx=i: hook_fn(mod, inp, out, idx)
@@ -66,7 +67,7 @@ class DinoClassifier(nn.Module):
 
     def set_mask(self, mask_1d):
         """
-        Updates the internal mask. 
+        Updates the internal mask.
         mask_1d: tensor of shape (144,) provided by the RL Agent.
         """
         self.mask = mask_1d.view(12, 12)
