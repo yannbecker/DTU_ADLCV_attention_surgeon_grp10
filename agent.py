@@ -17,6 +17,7 @@ import os
 import numpy as np
 
 from classification import DinoClassifier, validate, get_loaders
+from rl_utils import get_flops_ratio
 
 # ----------------- ENVIRONMENT -----------------
 
@@ -43,13 +44,11 @@ class PruningEnv:
 
     def _get_state(self):
         # State: 144-dim binary mask + task accuracy + FLOPs count
-        current_flops = self.mask.sum().item()
+        flops_ratio = get_flops_ratio(self.mask)
         state = torch.cat(
             [
                 self.mask,
-                torch.tensor(
-                    [self.current_acc / 100.0, current_flops / self.base_flops]
-                ).to(self.device),
+                torch.tensor([self.current_acc / 100.0, flops_ratio]).to(self.device),
             ]
         )
         return state
@@ -68,11 +67,11 @@ class PruningEnv:
         )
 
         # Calculate Reward: accuracy * (1 - (current FLOPs / base FLOPs))
-        current_flops = self.mask.sum().item()
-        reward = (new_acc / 100.0) * (1.0 - (current_flops / self.base_flops))
+        flops_ratio = get_flops_ratio(self.mask)
+        reward = (new_acc / 100.0) * (1.0 - flops_ratio)
 
         print(
-            f"   -> Step {self.steps}: Pruned Head {action_idx} | New Acc: {new_acc:.2f}% | Active Heads: {int(current_flops)}"
+            f"   -> Step {self.steps}: Pruned Head {action_idx} | New Acc: {new_acc:.2f}% | FLOPs Ratio: {flops_ratio:.4f} | Active Heads: {int(self.mask.sum().item())}"
         )
 
         self.current_acc = new_acc
