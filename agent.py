@@ -122,10 +122,12 @@ def train_ppo(args):
     env = PruningEnv(model, val_loader, device, max_pruning=args.max_pruning)
     policy = ActorCritic().to(device)
     optimizer = optim.Adam(policy.parameters(), lr=args.lr)
+    eps_clip = 0.2
+    gamma = 0.99
 
     for episode in range(args.episodes):
         state = env.reset()
-        log_probs, values, rewards, masks = [], [], [], []
+        states, actions, log_probs, rewards, values, masks = [], [], [], [], [], []
 
         # Episode: Sequentially prune heads
         for t in range(args.max_pruning):
@@ -135,6 +137,8 @@ def train_ppo(args):
 
             next_state, reward, done = env.step(action.item())
 
+            states.append(state)
+            actions.append(action)
             log_probs.append(dist.log_prob(action))
             values.append(value)
             rewards.append(reward)
@@ -144,10 +148,48 @@ def train_ppo(args):
             if done:
                 break
 
-        # PPO Update Logic (simplified)
-        # ... [Policy Gradient Update and Value Loss calculation would go here] ...
+        # 2. Compute Returns and Advantages
+        returns = []
+        discounted_reward = 0
+        for r in reversed(rewards):
+            discounted_reward = r + (gamma * discounted_reward)
+            returns.insert(0, discounted_reward)
+
+        returns = torch.tensor(returns, dtype=torch.float32).to(device)
+        values = torch.cat(values).squeeze()
+        advantages = returns - values.detach()
+        # Normalize advantages for stability
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+        # 3. PPO Update Step
+        old_states = torch.stack(states)
+        old_actions = torch.stack(actions)
+        old_log_probs = torch.stack(log_probs).detach()
+        old_masks = torch.stack(masks)
+
+        for _ in range(5):  # Optimize for K epochs
+            dist, val = policy(old_states, old_masks)
+            new_log_probs = dist.log_prob(old_actions)
+            entropy = dist.entropy().mean()
+
+            # Policy Loss (Clipped)
+            ratio = torch.exp(new_log_probs - old_log_probs)
+            surr1 = ratio * advantages
+            surr2 = torch.clamp(ratio, 1 - eps_clip, 1 + eps_clip) * advantages
+            actor_loss = -torch.min(surr1, surr2).mean()
+
+            # Value Loss (MSE)
+            critic_loss = F.mse_loss(val.squeeze(), returns)
+
+            # Total Loss
+            loss = actor_loss + 0.5 * critic_loss - 0.01 * entropy
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
         print(
-            f"Episode {episode} | Final Reward: {rewards[-1]:.4f} | Final Acc: {env.current_acc:.2f}%"
+            f"Episode {episode} | Final Reward: {rewards[-1]:.4f} | Final Acc: {env.current_acc:.2f}| Loss: {loss.item():.4f}%"
         )
 
 
