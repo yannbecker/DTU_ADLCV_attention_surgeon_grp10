@@ -129,6 +129,10 @@ def train_ppo(args):
     eps_clip = 0.2
     gamma = 0.99
 
+    # Create save directory
+    os.makedirs(args.save_dir, exist_ok=True)
+    best_reward = -float("inf")
+
     for episode in range(args.episodes):
         state = env.reset()
         states, actions, log_probs, rewards, values, masks = [], [], [], [], [], []
@@ -192,6 +196,28 @@ def train_ppo(args):
             loss.backward()
             optimizer.step()
 
+        # --- SAVE LOGIC ---
+        avg_reward = sum(rewards) / len(rewards)
+
+        # Save "Latest" model
+        checkpoint_path = os.path.join(args.save_dir, "surgeon_ppo_latest.pth")
+        torch.save(
+            {
+                "episode": episode,
+                "model_state_dict": policy.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "args": args,
+            },
+            checkpoint_path,
+        )
+
+        # Save "Best" model based on total episode reward
+        if avg_reward > best_reward:
+            best_reward = avg_reward
+            best_path = os.path.join(args.save_dir, "surgeon_ppo_best.pth")
+            torch.save(policy.state_dict(), best_path)
+            print(f"   *** New Best Reward! Saved to {best_path} ***")
+
         print(
             f"Episode {episode} | Final Reward: {rewards[-1]:.4f} | Final Acc: {env.current_acc:.2f}| Loss: {loss.item():.4f}%"
         )
@@ -206,6 +232,12 @@ if __name__ == "__main__":
         help="Path to trained DINOv2 linear probe",
     )
     parser.add_argument("--data_dir", type=str, default="./data")
+    parser.add_argument(
+        "--save_dir",
+        type=str,
+        default="./checkpoints_rl",
+        help="Where to save RL agent weights",
+    )
     parser.add_argument("--episodes", type=int, default=100)
     parser.add_argument("--max_pruning", type=int, default=72)
     parser.add_argument("--lr", type=float, default=3e-4)
