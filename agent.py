@@ -69,6 +69,10 @@ class PruningEnv:
         current_flops = self.mask.sum().item()
         reward = (new_acc / 100.0) * (1.0 - (current_flops / self.base_flops))
 
+        print(
+            f"   -> Step {self.steps}: Pruned Head {action_idx} | New Acc: {new_acc:.2f}% | Active Heads: {int(current_flops)}"
+        )
+
         self.current_acc = new_acc
         done = self.steps >= self.max_pruning
 
