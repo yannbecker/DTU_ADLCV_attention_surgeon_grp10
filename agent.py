@@ -59,13 +59,15 @@ class PruningEnv:
         self.mask[action_idx] = 0
         self.steps += 1
 
-        # 1. Update Model (This would require a hook or a masked forward pass)
-        # For now, we assume the validate function uses the mask
+        # Sync the mask with the model
+        self.model.set_mask(self.mask)
+
+        # Evaluate new accuracy after pruning
         _, new_acc = validate(
             self.model, self.dataloader, nn.CrossEntropyLoss(), self.device
         )
 
-        # 2. Calculate Reward: accuracy * (1 - (current FLOPs / base FLOPs))
+        # Calculate Reward: accuracy * (1 - (current FLOPs / base FLOPs))
         current_flops = self.mask.sum().item()
         reward = (new_acc / 100.0) * (1.0 - (current_flops / self.base_flops))
 
