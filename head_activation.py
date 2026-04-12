@@ -48,8 +48,8 @@ def compute_distance(attn_map, grid_size=16):
     # Pairwise Euclidean distances
     dists = torch.cdist(coords, coords, p=2)  # (256, 256)
 
-    # DINOv2 has 1 CLS token + 256 patches. We extract patch-to-patch attention.
-    attn_patches = attn_map[:, :, 1:, 1:]  # (B, H, 256, 256)
+    # Skip the 1 CLS token AND the 4 Register tokens - Slice from index 5 to the end to isolate the 256 patch tokens
+    attn_patches = attn_map[:, :, 5:, 5:]  # Now (B, H, 256, 256)
 
     # Weighted average distance per head
     avg_dist = torch.sum(attn_patches * dists, dim=-1)  # (B, H, 256)
