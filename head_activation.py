@@ -96,6 +96,10 @@ class HeadCensus:
 
     def run_census(self, dataloader, num_batches=10):
         self.model.eval()
+
+        for param in self.model.transformer.parameters():
+            param.requires_grad = True  # Enable gradients for importance metric
+
         criterion = nn.CrossEntropyLoss()
 
         for b_idx, (images, labels) in enumerate(tqdm(dataloader, desc="Census")):
@@ -141,6 +145,9 @@ class HeadCensus:
         # Normalize
         for key in self.metrics:
             self.metrics[key] /= num_batches
+
+        for param in self.model.transformer.parameters():
+            param.requires_grad = False  # Disable gradients after census
 
     def plot_results(self, task_name):
         fig, axes = plt.subplots(2, 2, figsize=(15, 12))
