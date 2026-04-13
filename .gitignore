@@ -1,7 +1,7 @@
 # Project results and data files
 results/
 data/
-checkpoints/
+checkpoints*/
 *.sh
 
 # Byte-compiled / optimized / DLL files

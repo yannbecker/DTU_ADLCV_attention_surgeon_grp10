@@ -17,7 +17,7 @@ import os
 import numpy as np
 
 from classification import DinoClassifier, validate, get_loaders
-from rl_utils import get_flops_ratio
+from rl_utils import get_flops_ratio, get_proxy_loader, FastProxyValidator
 
 # ----------------- ENVIRONMENT -----------------
 
@@ -25,7 +25,8 @@ from rl_utils import get_flops_ratio
 class PruningEnv:
     def __init__(self, model, dataloader, device, max_pruning=72):
         self.model = model
-        self.dataloader = dataloader
+        self.proxy_loader = get_proxy_loader(dataloader, num_samples=500)
+        self.validator = FastProxyValidator(model, self.proxy_loader, nn.CrossEntropyLoss(), device)
         self.device = device
         self.max_pruning = max_pruning  # Up to 72 heads
 
@@ -37,9 +38,7 @@ class PruningEnv:
         self.mask = torch.ones(self.num_heads).to(self.device)
         self.steps = 0
         # Get initial accuracy for the state
-        _, self.current_acc = validate(
-            self.model, self.dataloader, nn.CrossEntropyLoss(), self.device
-        )
+        _, self.current_acc = self.validator.evaluate(self.mask)
         return self._get_state()
 
     def _get_state(self):
@@ -62,9 +61,7 @@ class PruningEnv:
         self.model.set_mask(self.mask)
 
         # Evaluate new accuracy after pruning
-        _, new_acc = validate(
-            self.model, self.dataloader, nn.CrossEntropyLoss(), self.device
-        )
+        _, new_acc = self.validator.evaluate(self.mask)
 
         # Calculate Reward: accuracy * (1 - (current FLOPs / base FLOPs))
         flops_ratio = get_flops_ratio(self.mask)

@@ -1,4 +1,6 @@
 import torch
+from torch.utils.data import Subset, DataLoader
+import numpy as np
 
 """
 REPENSER A CA, comment recuperer et pruning 
@@ -92,3 +94,111 @@ def get_flops_ratio(mask):
     base_flops = calculate_theoretical_flops(full_mask)
     current_flops = calculate_theoretical_flops(mask)
     return current_flops / base_flops
+
+def get_proxy_loader(base_loader, num_samples=500, seed=42):
+    """
+    Creates a fixed, small proxy DataLoader from the base validation loader.
+    This guarantees the RL agent is evaluated on the exact same subset every step.
+    """
+    dataset = base_loader.dataset
+    total_samples = len(dataset)
+    
+    # Ensure we don't request more samples than the dataset holds
+    num_samples = min(num_samples, total_samples)
+    
+    # Use a fixed seed to ensure the proxy set is consistent across runs/episodes
+    np.random.seed(seed)
+    indices = np.random.choice(total_samples, num_samples, replace=False)
+    
+    proxy_dataset = Subset(dataset, indices)
+    
+    proxy_loader = DataLoader(
+        proxy_dataset, 
+        batch_size=base_loader.batch_size, 
+        shuffle=False, 
+        num_workers=base_loader.num_workers,
+        pin_memory=True # Speeds up transfer to GPU on HPC
+    )
+    
+    return proxy_loader
+
+
+class FastProxyValidator:
+    """
+    Handles rapid evaluation of the model for the RL environment.
+    Combines Proxy Data with Baseline Caching.
+    """
+    def __init__(self, model, proxy_loader, criterion, device):
+        self.model = model
+        self.proxy_loader = proxy_loader
+        self.criterion = criterion
+        self.device = device
+        
+        # Activation Caching
+        # We pre-compute and cache the prepared tokens (patch embeddings + CLS + Registers)
+        # This allows us to skip the image-to-patch extraction step during every RL step.
+        self.cached_inputs = []
+        self.cached_labels = []
+        self._build_cache()
+
+    def _build_cache(self):
+        """
+        Runs through the proxy loader once and stores the initial transformer inputs.
+        Requires ~400MB of VRAM for 500 images, easily fits on the HPC.
+        """
+        self.model.eval()
+        print(f"Building Proxy Cache for {len(self.proxy_loader.dataset)} samples...")
+        
+        with torch.no_grad():
+            for images, labels in self.proxy_loader:
+                images = images.to(self.device)
+                labels = labels.to(self.device)
+                
+                # Extract tokens exactly as DINOv2 does before the transformer blocks
+                # This skips the CNN/Patch Embedding overhead in future steps
+                tokens = self.model.transformer.prepare_tokens_with_masks(images)
+                
+                self.cached_inputs.append(tokens)
+                self.cached_labels.append(labels)
+                
+        print("Proxy Cache built successfully.")
+
+    def evaluate(self, mask):
+        """
+        Executes a rapid forward pass using cached tokens and the current RL mask.
+        """
+        self.model.eval()
+        self.model.set_mask(mask)
+        
+        running_loss = 0.0
+        correct = 0
+        total = 0
+        
+        with torch.no_grad():
+            for tokens, labels in zip(self.cached_inputs, self.cached_labels):
+                
+                # 1. Partial Forward Pass (Transformer blocks only)
+                # We bypass the standard model(x) to inject our cached tokens
+                x = tokens
+                for blk in self.model.transformer.blocks:
+                    x = blk(x)
+                    
+                x = self.model.transformer.norm(x)
+                
+                # DINOv2 CLS token is at index 0
+                cls_token = x[:, 0]
+                
+                # 2. Classifier Head
+                logits = self.model.classifier(cls_token)
+                loss = self.criterion(logits, labels)
+                
+                # 3. Metrics
+                running_loss += loss.item()
+                _, predicted = logits.max(1)
+                total += labels.size(0)
+                correct += predicted.eq(labels).sum().item()
+
+        accuracy = 100.0 * correct / total
+        avg_loss = running_loss / len(self.cached_labels)
+        
+        return avg_loss, accuracy
