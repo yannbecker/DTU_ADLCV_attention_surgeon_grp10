@@ -105,8 +105,8 @@ class HeadCensus:
         self.num_heads = 12
         self.head_dim = 768 // self.num_heads
 
-        # Metric order: 0: Entropy, 1: Distance, 2: Rollout, 3: Depth, 4: Residual Contrib
-        self.head_metrics = torch.zeros(6, self.num_layers, self.num_heads).to(device)
+        # Metric order: 0: Entropy, 1: Distance, 2: Rollout, 3: Depth, 4: Residual Contrib, 5: Taylor Importance, 6: Intre-Layer Rank
+        self.head_metrics = torch.zeros(7, self.num_layers, self.num_heads).to(device)
         
         # Pre-fill Depth (Metric index 3)
         for i in range(self.num_layers):
@@ -208,19 +208,22 @@ class HeadCensus:
                     # Note: Rollout is N x N, we take the mean "influence" per layer
                     self.head_metrics[2, i] += rollout_maps[i].mean()
 
+            # Get taylor Importance and Intra-Layer Rank metrics
             batch_taylor = self.model.get_taylor_importance(images, labels, criterion)
+            batch_ranks = self.model.get_intra_layer_ranks(batch_taylor)
             self.head_metrics[5, :, :] += batch_taylor
+            self.head_metrics[6, :, :] += batch_ranks
 
         # Normalize across batches (excluding static Depth at index 3)
         for idx in [0, 1, 2, 4]:
             self.head_metrics[idx] /= num_batches
 
     def plot_results(self, task_name):
-        metric_names = ["Entropy", "Distance", "Rollout", "Depth", "Res_Contrib", "Taylor Importance"]
-        fig, axes = plt.subplots(1, 6, figsize=(30, 5))
+        metric_names = ["Entropy", "Distance", "Rollout", "Depth", "Res_Contrib", "Taylor Importance", "Intra-Layer Rank"]
+        fig, axes = plt.subplots(1, 7, figsize=(30, 5))
         fig.suptitle(f"Head Census - {task_name}", fontsize=16)
 
-        for i in range(6):
+        for i in range(7):
             data = self.head_metrics[i].cpu().numpy()
             im = axes[i].imshow(data, cmap="magma")
             axes[i].set_title(metric_names[i])
@@ -284,7 +287,7 @@ def main():
             )
 
         # Retrieve loaders using the helper from classification.py
-        dataloader, _ = get_loaders(args.data_dir, args.batch_size, num_workers=2)
+        dataloader, _, _ = get_loaders("cifar10", args.data_dir, args.batch_size, num_workers=2)
 
     else:
         # Placeholder for Task 2 and 3 implementation
