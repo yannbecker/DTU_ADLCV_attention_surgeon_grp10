@@ -14,10 +14,12 @@ import torch.optim as optim
 from torch.distributions import Categorical
 import argparse
 import os
+import re
 import numpy as np
 
 from classification import DinoClassifier, validate, get_loaders
 from rl_utils import get_flops_ratio, get_proxy_loader, FastProxyValidator
+from head_activation import HeadCensus
 
 # ----------------- ENVIRONMENT -----------------
 
@@ -25,13 +27,20 @@ from rl_utils import get_flops_ratio, get_proxy_loader, FastProxyValidator
 class PruningEnv:
     def __init__(self, model, dataloader, device, max_pruning=72):
         self.model = model
-        self.proxy_loader = get_proxy_loader(dataloader, num_samples=500)
-        self.validator = FastProxyValidator(model, self.proxy_loader, nn.CrossEntropyLoss(), device)
         self.device = device
         self.max_pruning = max_pruning  # Up to 72 heads
 
         self.num_heads = 144
         self.base_flops = self.num_heads  # Simplified proxy for FLOPs
+
+        self.proxy_loader = get_proxy_loader(dataloader, num_samples=500)
+        self.validator = FastProxyValidator(
+            model, self.proxy_loader, nn.CrossEntropyLoss(), device
+        )
+
+        self.micro_census_loader = get_proxy_loader(dataloader, num_samples=16, seed=99)
+        self.census = HeadCensus(model, device)
+
         self.reset()
 
     def reset(self):
@@ -41,16 +50,50 @@ class PruningEnv:
         _, self.current_acc = self.validator.evaluate(self.mask)
         return self._get_state()
 
+    def _get_valid_action_mask(self):
+        """
+        PREVENTS LAYER COLLAPSE:
+        If a layer has 1 (or 0) heads left, mask it out so the agent cannot prune it.
+        """
+        valid_mask = self.mask.clone()
+        for layer_idx in range(12):
+            start_idx = layer_idx * 12
+            end_idx = start_idx + 12
+
+            # Count active heads in this specific layer
+            active_in_layer = self.mask[start_idx:end_idx].sum().item()
+
+            if active_in_layer <= 1:
+                # Forbid pruning any remaining heads in this layer
+                valid_mask[start_idx:end_idx] = 0
+
+        return valid_mask
+
     def _get_state(self):
-        # State: 144-dim binary mask + task accuracy + FLOPs count
-        flops_ratio = get_flops_ratio(self.mask)
-        state = torch.cat(
-            [
-                self.mask,
-                torch.tensor([self.current_acc / 100.0, flops_ratio]).to(self.device),
-            ]
+        # Re-run the census on just 16 images - zero out old metrics and fill in new ones
+        self.census.all_metrics.zero_()
+        for i in range(12):
+            self.census.all_metrics[3, i, :] = (i + 1) / 12.0
+        self.census.run_census(self.micro_census_loader, num_batches=1)
+
+        # Ensure pruned heads are explicitly zeroed out in the metrics
+        spatial_mask = self.mask.view(12, 12).unsqueeze(0)
+        current_metrics = (
+            self.census.all_metrics[:7].clone().to(self.device) * spatial_mask
         )
-        return state
+
+        # 2. Get Scalars
+        flops_ratio = get_flops_ratio(self.mask)
+        scalars = torch.tensor([self.current_acc / 100.0, flops_ratio]).to(self.device)
+
+        # 3. Get the Safeguard Mask
+        safe_action_mask = self._get_valid_action_mask()
+
+        return {
+            "metric_grid": current_metrics,
+            "scalars": scalars,
+            "mask": safe_action_mask,  # Give the policy the restricted mask!
+        }
 
     def step(self, action_idx):
         # Apply pruning (Action: index of the next head to prune)
@@ -102,6 +145,129 @@ class ActorCritic(nn.Module):
         return Categorical(probs), value
 
 
+class MiniViT(nn.Module):
+    """
+    A lightweight Vision Transformer specifically designed for a 12x12 metric grid.
+    Uses 1x1 patches so each of the 144 attention heads becomes its own token.
+    """
+
+    def __init__(self, n_metrics=7, embed_dim=64, num_layers=3, num_heads=4):
+        super(MiniViT, self).__init__()
+
+        self.num_patches = 144  # 12x12 grid
+        self.embed_dim = embed_dim
+
+        # 1. Patch Embedding (1x1 patch means we just project the n_metrics to embed_dim)
+        # Input shape: (Batch, n_metrics, 12, 12)
+        # Flattened shape: (Batch, n_metrics, 144) -> permuted to (Batch, 144, n_metrics)
+        self.patch_proj = nn.Linear(n_metrics, embed_dim)
+
+        # 2. CLS Token & Positional Encoding
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        # +1 for the CLS token
+        self.pos_embed = nn.Parameter(
+            torch.randn(1, self.num_patches + 1, embed_dim) * 0.02
+        )
+
+        # 3. Transformer Encoder Blocks
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim,
+            nhead=num_heads,
+            dim_feedforward=embed_dim * 4,
+            dropout=0.1,
+            activation="gelu",
+            batch_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.norm = nn.LayerNorm(embed_dim)
+
+    def forward(self, x):
+        B = x.shape[0]
+
+        # Flatten spatial dimensions: (B, n_metrics, 12, 12) -> (B, n_metrics, 144)
+        x = x.view(B, x.shape[1], -1)
+        # Permute to (B, 144, n_metrics) for the linear layer
+        x = x.permute(0, 2, 1)
+
+        # Project tokens to embed_dim
+        x = self.patch_proj(x)
+
+        # Prepend CLS token: (B, 145, embed_dim)
+        cls_tokens = self.cls_token.expand(B, -1, -1)
+        x = torch.cat((cls_tokens, x), dim=1)
+
+        # Add Positional Encoding
+        x = x + self.pos_embed
+
+        # Pass through Transformer
+        x = self.transformer(x)
+        x = self.norm(x)
+
+        # Extract the CLS token output (index 0)
+        return x[:, 0]
+
+
+class AdvancedActorCritic(nn.Module):
+    """
+    The new PPO architecture integrating the MiniViT and scalar metrics.
+    """
+
+    def __init__(self, n_metrics=7, vit_embed_dim=64, hidden_dim=256, action_dim=144):
+        super(AdvancedActorCritic, self).__init__()
+
+        # 1. Spatial Feature Extractor
+        self.vit = MiniViT(n_metrics=n_metrics, embed_dim=vit_embed_dim)
+
+        # 2. Fusion Layer (ViT CLS token + Accuracy + FLOPs)
+        # Dimension: vit_embed_dim + 2 scalars
+        fused_dim = vit_embed_dim + 2
+
+        # Shared MLP for higher-level reasoning after fusion
+        self.shared_mlp = nn.Sequential(
+            nn.Linear(fused_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+        )
+
+        # 3. Output Heads
+        self.actor = nn.Linear(hidden_dim, action_dim)
+        self.critic = nn.Linear(hidden_dim, 1)
+
+    def forward(self, metric_grid, scalars, mask):
+        """
+        Args:
+            metric_grid: Tensor of shape (B, n_metrics, 12, 12)
+            scalars: Tensor of shape (B, 2) containing [Accuracy, FLOPs_Ratio]
+            mask: Tensor of shape (B, 144) indicating active heads (1) and pruned heads (0)
+        """
+        # Ensure correct dimensionality if unbatched (e.g., single step in env)
+        if metric_grid.dim() == 3:
+            metric_grid = metric_grid.unsqueeze(0)
+            scalars = scalars.unsqueeze(0)
+            mask = mask.unsqueeze(0)
+
+        # 1. Extract global feature vector from the grid
+        cls_feature = self.vit(metric_grid)  # Shape: (B, vit_embed_dim)
+
+        # 2. Concatenate with scalars
+        fused_state = torch.cat([cls_feature, scalars], dim=-1)  # Shape: (B, fused_dim)
+
+        # 3. Process through shared MLP
+        x = self.shared_mlp(fused_state)
+
+        # 4. Actor Head (with masking)
+        logits = self.actor(x)
+        # Mask out already pruned heads to prevent the agent from selecting them
+        logits = logits.masked_fill(mask == 0, -1e9)
+        probs = F.softmax(logits, dim=-1)
+
+        # 5. Critic Head
+        value = self.critic(x)
+
+        return Categorical(probs), value
+
+
 # ----------------- TRAINING LOGIC -----------------
 
 
@@ -110,19 +276,33 @@ def train_ppo(args):
         args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu")
     )
 
-    # Initialize Model and Data
-    model = DinoClassifier(device=device, num_classes=10).to(device)
+    # Parse the dataset name from the checkpoint filename (e.g., "dino_imagenet100_latest.pth")
+    filename = os.path.basename(args.checkpoint)
+    match = re.search(r"dino_(.*?)_(latest|epoch)", filename)
+
+    if match:
+        dataset_name = match.group(1)
+        print(f"[Auto-Detect] Extracted dataset '{dataset_name}' from checkpoint name.")
+    else:
+        # Fallback just in case the file was renamed manually
+        dataset_name = "imagenet100"
+        print(
+            f"[Warning] Could not auto-detect dataset from '{filename}'. Defaulting to '{dataset_name}'."
+        )
+
+    # Initialize Model and Data Loaders
+    _, val_loader, num_classes = get_loaders(
+        dataset_name, args.data_dir, args.batch_size, num_workers=2
+    )
+    model = DinoClassifier(device=device, num_classes=num_classes).to(device)
+
     if os.path.exists(args.checkpoint):
         model.load_state_dict(
             torch.load(args.checkpoint, map_location=device)["model_state_dict"]
         )
 
-    train_loader, val_loader = get_loaders(
-        args.data_dir, args.batch_size, num_workers=2
-    )
-
     env = PruningEnv(model, val_loader, device, max_pruning=args.max_pruning)
-    policy = ActorCritic().to(device)
+    policy = AdvancedActorCritic(n_metrics=7).to(device)
     optimizer = optim.Adam(policy.parameters(), lr=args.lr)
     eps_clip = 0.2
     gamma = 0.99
@@ -131,26 +311,40 @@ def train_ppo(args):
     os.makedirs(args.save_dir, exist_ok=True)
     best_reward = -float("inf")
 
+    print("Starting PPO Training Loop...")
     for episode in range(args.episodes):
-        state = env.reset()
-        states, actions, log_probs, rewards, values, masks = [], [], [], [], [], []
+        print(f"\n--- Episode {episode+1}/{args.episodes} ---")
+        state_dict = env.reset()
+        grids, scalars, masks, actions, log_probs, rewards, values = (
+            [],
+            [],
+            [],
+            [],
+            [],
+            [],
+            [],
+        )
 
         # Episode: Sequentially prune heads
         for t in range(args.max_pruning):
-            mask = state[:144]
-            dist, value = policy(state, mask)
+            grid = state_dict["metric_grid"]
+            scalar = state_dict["scalars"]
+            mask = state_dict["mask"]
+
+            dist, value = policy(grid, scalar, mask)
             action = dist.sample()
 
-            next_state, reward, done = env.step(action.item())
+            next_state_dict, reward, done = env.step(action.item())
 
-            states.append(state)
+            grids.append(grid)
+            scalars.append(scalar)
+            masks.append(mask)
             actions.append(action)
             log_probs.append(dist.log_prob(action))
             values.append(value)
             rewards.append(reward)
-            masks.append(mask)
 
-            state = next_state
+            state_dict = next_state_dict
             if done:
                 break
 
@@ -168,13 +362,14 @@ def train_ppo(args):
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
         # 3. PPO Update Step
-        old_states = torch.stack(states)
+        old_grids = torch.stack(grids)
+        old_scalars = torch.stack(scalars)
+        old_masks = torch.stack(masks)
         old_actions = torch.stack(actions)
         old_log_probs = torch.stack(log_probs).detach()
-        old_masks = torch.stack(masks)
 
         for _ in range(5):  # Optimize for K epochs
-            dist, val = policy(old_states, old_masks)
+            dist, val = policy(old_grids, old_scalars, old_masks)
             new_log_probs = dist.log_prob(old_actions)
             entropy = dist.entropy().mean()
 
@@ -198,26 +393,20 @@ def train_ppo(args):
         avg_reward = sum(rewards) / len(rewards)
 
         # Save "Latest" model
-        checkpoint_path = os.path.join(args.save_dir, "surgeon_ppo_latest.pth")
         torch.save(
-            {
-                "episode": episode,
-                "model_state_dict": policy.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "args": args,
-            },
-            checkpoint_path,
+            policy.state_dict(), os.path.join(args.save_dir, "surgeon_ppo_latest.pth")
         )
 
         # Save "Best" model based on total episode reward
         if avg_reward > best_reward:
             best_reward = avg_reward
-            best_path = os.path.join(args.save_dir, "surgeon_ppo_best.pth")
-            torch.save(policy.state_dict(), best_path)
-            print(f"   *** New Best Reward! Saved to {best_path} ***")
+            torch.save(
+                policy.state_dict(), os.path.join(args.save_dir, "surgeon_ppo_best.pth")
+            )
+            print(f"   *** New Best Reward! ({best_reward:.4f}) ***")
 
         print(
-            f"Episode {episode} | Final Reward: {rewards[-1]:.4f} | Final Acc: {env.current_acc:.2f}| Loss: {loss.item():.4f}%"
+            f"Final Step Acc: {env.current_acc:.2f}% | Avg Reward: {avg_reward:.4f} | Loss: {loss.item():.4f}"
         )
 
 
