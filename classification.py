@@ -20,6 +20,7 @@ class DinoClassifier(nn.Module):
     def __init__(self, device, num_classes=10):
         super(DinoClassifier, self).__init__()
         self.transformer = load_model(device)
+        self.num_heads = 12
 
         # Freeze the backbone for linear probing [cite: 40, 44]
         for param in self.transformer.parameters():
@@ -133,6 +134,24 @@ class DinoClassifier(nn.Module):
             h.remove()
 
         return taylor_scores
+    
+    def get_intra_layer_ranks(self, taylor_importance_matrix):
+        """
+        Computes the relative rank of each head within its own layer.
+        Input: (12, 12) matrix of Taylor Importance scores.
+        Output: (12, 12) matrix of normalized ranks [0, 1].
+        """
+        # taylor_importance_matrix shape: (Layers=12, Heads=12)
+        
+        # 1. Get ranks: argsort twice gives the rank (0 to 11)
+        # Higher importance = Higher rank index
+        ranks = torch.argsort(torch.argsort(taylor_importance_matrix, dim=1), dim=1).float()
+        
+        # 2. Normalize to [0, 1]
+        # (Rank / (Num_Heads - 1)) -> 0.0 is the least important, 1.0 is the most important
+        normalized_ranks = ranks / (self.num_heads - 1) 
+        
+        return normalized_ranks
 
     def forward(self, x):
         # DINOv2 returns the CLS token by default in this configuration
