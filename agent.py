@@ -71,15 +71,15 @@ class PruningEnv:
 
     def _get_state(self):
         # Re-run the census on just 16 images - zero out old metrics and fill in new ones
-        self.census.all_metrics.zero_()
+        self.census.head_metrics.zero_()
         for i in range(12):
-            self.census.all_metrics[3, i, :] = (i + 1) / 12.0
+            self.census.head_metrics[3, i, :] = (i + 1) / 12.0
         self.census.run_census(self.micro_census_loader, num_batches=1)
 
         # Ensure pruned heads are explicitly zeroed out in the metrics
         spatial_mask = self.mask.view(12, 12).unsqueeze(0)
         current_metrics = (
-            self.census.all_metrics[:7].clone().to(self.device) * spatial_mask
+            self.census.head_metrics[:7].clone().to(self.device) * spatial_mask
         )
 
         # 2. Get Scalars
