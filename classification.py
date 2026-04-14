@@ -272,8 +272,7 @@ if __name__ == "__main__":
         "--dataset",
         type=str,
         default="cifar10",
-        choices=["cifar10", "imagenet", "imagenet100"],
-        help="Which dataset to use",
+        help="cifar10, imagenet, imagenet100, imagenet50, etc.",
     )
     parser.add_argument(
         "--data_dir", type=str, default="./data", help="Path to dataset"
