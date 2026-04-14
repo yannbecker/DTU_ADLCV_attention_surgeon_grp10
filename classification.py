@@ -9,6 +9,7 @@ from tqdm.auto import tqdm
 import matplotlib.pyplot as plt
 import os
 import argparse
+import re
 
 
 class DinoClassifier(nn.Module):
@@ -116,28 +117,90 @@ def validate(model, loader, criterion, device):
     return running_loss / len(loader), accuracy
 
 
-def get_loaders(data_dir, batch_size, num_workers):
+def get_loaders(dataset_name, data_dir, batch_size, num_workers):
     base_transform = transforms.Compose(
         [
-            transforms.Resize(224),
+            transforms.Resize(256),
+            transforms.CenterCrop(224),  # Standard ImageNet cropping
             transforms.ToTensor(),
             transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
         ]
     )
-    train_set = torchvision.datasets.CIFAR10(
-        root=data_dir, train=True, download=True, transform=base_transform
-    )
-    test_set = torchvision.datasets.CIFAR10(
-        root=data_dir, train=False, download=True, transform=base_transform
-    )
+
+    if dataset_name == "cifar10":
+        train_set = torchvision.datasets.CIFAR10(
+            root=data_dir, train=True, download=True, transform=base_transform
+        )
+        test_set = torchvision.datasets.CIFAR10(
+            root=data_dir, train=False, download=True, transform=base_transform
+        )
+        num_classes = 10
+
+    elif dataset_name.startswith("imagenet"):
+        # Dynamically extract the number of classes requested (default to 1000 if just 'imagenet')
+        if dataset_name == "imagenet":
+            num_classes = 1000
+        else:
+            match = re.search(r"imagenet(\d+)", dataset_name)
+            if match:
+                num_classes = int(match.group(1))
+            else:
+                raise ValueError(
+                    f"Invalid dataset name format: {dataset_name}. Use 'imagenet' or 'imagenetX' (e.g., imagenet100)."
+                )
+
+        # Resolve paths for HPC Kaggle format vs standard format
+        hpc_train = os.path.join(data_dir, "ILSVRC/Data/CLS-LOC/train")
+        hpc_val = os.path.join(data_dir, "ILSVRC/Data/CLS-LOC/val")
+        std_train = os.path.join(data_dir, "train")
+        std_val = os.path.join(data_dir, "val")
+
+        if os.path.exists(hpc_train):
+            train_dir, val_dir = hpc_train, hpc_val
+        elif os.path.exists(std_train):
+            train_dir, val_dir = std_train, std_val
+        else:
+            raise FileNotFoundError(f"Could not find train/val folders in {data_dir}.")
+
+        print(f"Loading base ImageNet from {train_dir} and {val_dir}...")
+        train_set = torchvision.datasets.ImageFolder(
+            train_dir, transform=base_transform
+        )
+        test_set = torchvision.datasets.ImageFolder(val_dir, transform=base_transform)
+
+        # Subsetting logic: Keep only the first `num_classes`
+        if num_classes < 1000:
+            print(f"Subsetting ImageNet to the first {num_classes} classes...")
+            valid_indices = set(range(num_classes))
+
+            # Filter samples and targets directly
+            train_set.samples = [s for s in train_set.samples if s[1] in valid_indices]
+            train_set.targets = [t for t in train_set.targets if t in valid_indices]
+            train_set.classes = train_set.classes[:num_classes]
+
+            test_set.samples = [s for s in test_set.samples if s[1] in valid_indices]
+            test_set.targets = [t for t in test_set.targets if t in valid_indices]
+            test_set.classes = test_set.classes[:num_classes]
+
+    else:
+        raise ValueError(f"Dataset {dataset_name} not supported.")
 
     train_loader = DataLoader(
-        train_set, batch_size=batch_size, shuffle=True, num_workers=num_workers
+        train_set,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=True,
     )
     test_loader = DataLoader(
-        test_set, batch_size=batch_size, shuffle=False, num_workers=num_workers
+        test_set,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
     )
-    return train_loader, test_loader
+
+    return train_loader, test_loader, num_classes
 
 
 def main(args):
@@ -147,20 +210,13 @@ def main(args):
     print(f"Using device: {device}")
 
     # ------------------- DATASET SETUP
-    base_transform = transforms.Compose(
-        [
-            transforms.Resize(224),
-            transforms.ToTensor(),
-            transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
-        ]
+    train_loader, test_loader, num_classes = get_loaders(
+        args.dataset, args.data_dir, args.batch_size, args.num_workers
     )
-
-    train_loader, test_loader = get_loaders(
-        args.data_dir, args.batch_size, args.num_workers
-    )
+    print(f"Dataset initialized with {num_classes} classes.")
 
     # ------------------- MODEL SETUP
-    model = DinoClassifier(device, num_classes=10).to(device)
+    model = DinoClassifier(device, num_classes=num_classes).to(device)
     os.makedirs(args.checkpoint_dir, exist_ok=True)
 
     criterion = nn.CrossEntropyLoss()
@@ -182,13 +238,14 @@ def main(args):
 
         # Save Checkpoint
         checkpoint_path = os.path.join(
-            args.checkpoint_dir, f"dino_classifier_latest.pth"
+            args.checkpoint_dir, f"dino_{args.dataset}_latest.pth"
         )
         torch.save(
             {
                 "epoch": epoch + 1,
                 "model_state_dict": model.state_dict(),
                 "val_acc": v_acc,
+                "num_classes": num_classes,
             },
             checkpoint_path,
         )
@@ -201,8 +258,8 @@ def main(args):
     plt.xlabel("Epoch")
     plt.ylabel("Loss")
     plt.legend()
-    plt.savefig(os.path.join("figure", "train_val_curve.jpg"))
-    print("Training curve saved to figure/train_val_curve.jpg")
+    plt.savefig(os.path.join("figure", f"train_val_curve_{args.dataset}.jpg"))
+    print(f"Training curve saved to figure/train_val_curve_{args.dataset}.jpg")
 
 
 if __name__ == "__main__":
@@ -211,6 +268,13 @@ if __name__ == "__main__":
     )
 
     # Path Arguments
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default="cifar10",
+        choices=["cifar10", "imagenet", "imagenet100"],
+        help="Which dataset to use",
+    )
     parser.add_argument(
         "--data_dir", type=str, default="./data", help="Path to dataset"
     )
