@@ -20,6 +20,7 @@ class DinoClassifier(nn.Module):
     def __init__(self, device, num_classes=10):
         super(DinoClassifier, self).__init__()
         self.transformer = load_model(device)
+        self.num_heads = 12
 
         # Freeze the backbone for linear probing [cite: 40, 44]
         for param in self.transformer.parameters():
@@ -72,6 +73,85 @@ class DinoClassifier(nn.Module):
         mask_1d: tensor of shape (144,) provided by the RL Agent.
         """
         self.mask = mask_1d.view(12, 12)
+
+    # Inside class DinoClassifier
+    def set_heads_requires_grad(self, requires_grad=True):
+        """
+        Ensures that the outputs of the attention layers track gradients
+        even if the weights themselves are frozen.
+        """
+        for layer_idx in range(12):
+            # We target the attn layer output
+            self.transformer.blocks[layer_idx].attn.requires_grad_(requires_grad)
+
+    def get_taylor_importance(self, images, labels, criterion):
+        self.eval() 
+        taylor_scores = torch.zeros(12, 12).to(images.device)
+        activations = {}
+        grads = {}
+
+        def save_activation(name):
+            def hook(model, input, output):
+                # CRITICAL FIX: The output of a frozen layer has requires_grad=False.
+                # We force it to True so we can register a hook and compute Taylor importance.
+                output.requires_grad_(True) 
+                activations[name] = output.detach()
+                output.register_hook(lambda g: grads.update({name: g}))
+            return hook
+
+        # 1. Attach temporary hooks
+        temp_hooks = []
+        for i in range(12):
+            # Using the existing transformer blocks
+            h = self.transformer.blocks[i].attn.register_forward_hook(save_activation(f"layer_{i}"))
+            temp_hooks.append(h)
+
+        # 2. Forward pass (Inside a gradient-enabled context)
+        with torch.set_grad_enabled(True):
+            logits = self.forward(images)
+            loss = criterion(logits, labels)
+
+            # 3. Backward pass
+            self.zero_grad()
+            loss.backward()
+
+        # 4. Compute Taylor Importance: |Activation * Gradient|
+        for i in range(12):
+            if f"layer_{i}" in grads:
+                act = activations[f"layer_{i}"]  # (B, N, 768)
+                grad = grads[f"layer_{i}"]       # (B, N, 768)
+                
+                # Reshape to 12 heads
+                act = act.view(act.size(0), act.size(1), 12, 64)
+                grad = grad.view(grad.size(0), grad.size(1), 12, 64)
+                
+                # Sum over HeadDim (64) and average over Batch/Tokens
+                score = torch.abs((act * grad).sum(dim=-1)).mean(dim=(0, 1))
+                taylor_scores[i] = score
+
+        # Clean up hooks
+        for h in temp_hooks:
+            h.remove()
+
+        return taylor_scores
+    
+    def get_intra_layer_ranks(self, taylor_importance_matrix):
+        """
+        Computes the relative rank of each head within its own layer.
+        Input: (12, 12) matrix of Taylor Importance scores.
+        Output: (12, 12) matrix of normalized ranks [0, 1].
+        """
+        # taylor_importance_matrix shape: (Layers=12, Heads=12)
+        
+        # 1. Get ranks: argsort twice gives the rank (0 to 11)
+        # Higher importance = Higher rank index
+        ranks = torch.argsort(torch.argsort(taylor_importance_matrix, dim=1), dim=1).float()
+        
+        # 2. Normalize to [0, 1]
+        # (Rank / (Num_Heads - 1)) -> 0.0 is the least important, 1.0 is the most important
+        normalized_ranks = ranks / (self.num_heads - 1) 
+        
+        return normalized_ranks
 
     def forward(self, x):
         # DINOv2 returns the CLS token by default in this configuration

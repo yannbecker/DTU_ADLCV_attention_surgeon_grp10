@@ -51,9 +51,6 @@ def compute_distance(attn_map, grid_size=16):
     # Skip the 1 CLS token AND the 4 Register tokens - Slice from index 5 to the end to isolate the 256 patch tokens
     attn_patches = attn_map[:, :, 5:, 5:]  # Now (B, H, 256, 256)
 
-    """# renormalization
-    attn_patches = attn_patches / (attn_patches.sum(dim=-1, keepdim=True) + 1e-8)"""
-
     # Weighted average distance per head
     avg_dist = torch.sum(attn_patches * dists, dim=-1)  # (B, H, 256)
     return avg_dist.mean(dim=(0, 2))  # (H,)
@@ -110,12 +107,12 @@ class HeadCensus:
         self.num_heads = 12
         self.head_dim = 768 // self.num_heads
 
-        # Metric order: 0: Entropy, 1: Distance, 2: Rollout, 3: Depth, 4: Residual Contrib
-        self.all_metrics = torch.zeros(5, self.num_layers, self.num_heads).to(device)
+        # Metric order: 0: Entropy, 1: Distance, 2: Rollout, 3: Depth, 4: Residual Contrib, 5: Taylor Importance, 6: Intre-Layer Rank
+        self.head_metrics = torch.zeros(7, self.num_layers, self.num_heads).to(device)
 
         # Pre-fill Depth (Metric index 3)
         for i in range(self.num_layers):
-            self.all_metrics[3, i, :] = (i + 1) / 12.0
+            self.head_metrics[3, i, :] = (i + 1) / 12.0
 
     def get_attention_map(self, x, layer_idx):
         """
@@ -184,8 +181,8 @@ class HeadCensus:
 
     def run_census(self, dataloader, num_batches=10):
         self.model.eval()
-        for param in self.model.transformer.parameters():
-            param.requires_grad = True
+        torch.set_grad_enabled(True)
+        criterion = torch.nn.CrossEntropyLoss()
 
         for b_idx, (images, labels) in enumerate(tqdm(dataloader, desc="Census")):
             if b_idx >= num_batches:
@@ -202,11 +199,11 @@ class HeadCensus:
 
                 with torch.no_grad():
                     # (0) Entropy
-                    self.all_metrics[0, i] += compute_entropy(attn_map)
+                    self.head_metrics[0, i] += compute_entropy(attn_map)
                     # (1) Distance
-                    self.all_metrics[1, i] += compute_distance(attn_map)
+                    self.head_metrics[1, i] += compute_distance(attn_map)
                     # (4) Residual Contribution
-                    self.all_metrics[4, i] += self.compute_residual_contribution(x, i)
+                    self.head_metrics[4, i] += self.compute_residual_contribution(x, i)
 
                 x = self.model.transformer.blocks[i](x)
 
@@ -219,19 +216,33 @@ class HeadCensus:
                 for i in range(self.num_layers):
                     # We average the rollout flow map for that layer
                     # Note: Rollout is N x N, we take the mean "influence" per layer
-                    self.all_metrics[2, i] += rollout_maps[i].mean()
+                    self.head_metrics[2, i] += rollout_maps[i].mean()
+
+            # Get taylor Importance and Intra-Layer Rank metrics
+            batch_taylor = self.model.get_taylor_importance(images, labels, criterion)
+            batch_ranks = self.model.get_intra_layer_ranks(batch_taylor)
+            self.head_metrics[5, :, :] += batch_taylor
+            self.head_metrics[6, :, :] += batch_ranks
 
         # Normalize across batches (excluding static Depth at index 3)
         for idx in [0, 1, 2, 4]:
-            self.all_metrics[idx] /= num_batches
+            self.head_metrics[idx] /= num_batches
 
     def plot_results(self, task_name):
-        metric_names = ["Entropy", "Distance", "Rollout", "Depth", "Res_Contrib"]
-        fig, axes = plt.subplots(1, 5, figsize=(25, 5))
+        metric_names = [
+            "Entropy",
+            "Distance",
+            "Rollout",
+            "Depth",
+            "Res_Contrib",
+            "Taylor Importance",
+            "Intra-Layer Rank",
+        ]
+        fig, axes = plt.subplots(1, 7, figsize=(30, 5))
         fig.suptitle(f"Head Census - {task_name}", fontsize=16)
 
-        for i in range(5):
-            data = self.all_metrics[i].cpu().numpy()
+        for i in range(7):
+            data = self.head_metrics[i].cpu().numpy()
             im = axes[i].imshow(data, cmap="magma")
             axes[i].set_title(metric_names[i])
             axes[i].set_xlabel("Head")

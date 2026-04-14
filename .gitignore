@@ -10,7 +10,7 @@ checkpoints*/
 __pycache__/
 *.py[codz]
 *$py.class
-
+playground.md
 # C extensions
 *.so
 
