@@ -55,19 +55,20 @@ def compute_distance(attn_map, grid_size=16):
     avg_dist = torch.sum(attn_patches * dists, dim=-1)  # (B, H, 256)
     return avg_dist.mean(dim=(0, 2))  # (H,)
 
+
 def compute_attention_rollout(all_layer_attn):
     """
     Computes Attention Rollout as per Abnar & Zuidema (2020).
-    
+
     Args:
-        all_layer_attn: List or Tensor of shape (L, B, H, N, N) 
+        all_layer_attn: List or Tensor of shape (L, B, H, N, N)
                         containing attention maps for each layer.
     Returns:
         rollout_maps: Tensor of shape (L, B, N, N) showing accumulated flow.
     """
     num_layers, B, H, N, _ = all_layer_attn.shape
     device = all_layer_attn.device
-    
+
     # Initialize the rollout with an Identity matrix (the flow at "layer -1")
     curr_rollout = torch.eye(N, device=device).expand(B, N, N)
     rollout_results = []
@@ -76,23 +77,24 @@ def compute_attention_rollout(all_layer_attn):
         # 1. Average across heads (Standard Rollout procedure)
         # Shape: (B, N, N)
         layer_attn = all_layer_attn[i].mean(dim=1)
-        
+
         # 2. Account for Residual Connections
         # A_bar = 0.5 * I + 0.5 * A
         # This models the fact that the token retains its own identity
         eye = torch.eye(N, device=device).expand(B, N, N)
         layer_attn_res = 0.5 * layer_attn + 0.5 * eye
-        
+
         # 3. Re-normalize to ensure rows sum to 1
         layer_attn_res = layer_attn_res / layer_attn_res.sum(dim=-1, keepdim=True)
-        
+
         # 4. Multiply current layer flow by accumulated flow
         # Rollout(i) = A_i * Rollout(i-1)
         curr_rollout = torch.matmul(layer_attn_res, curr_rollout)
-        
+
         rollout_results.append(curr_rollout)
 
-    return torch.stack(rollout_results) # (L, B, N, N)
+    return torch.stack(rollout_results)  # (L, B, N, N)
+
 
 # ----------------- CENSUS RUNNER -----------------
 
@@ -107,7 +109,7 @@ class HeadCensus:
 
         # Metric order: 0: Entropy, 1: Distance, 2: Rollout, 3: Depth, 4: Residual Contrib, 5: Taylor Importance, 6: Intre-Layer Rank
         self.head_metrics = torch.zeros(7, self.num_layers, self.num_heads).to(device)
-        
+
         # Pre-fill Depth (Metric index 3)
         for i in range(self.num_layers):
             self.head_metrics[3, i, :] = (i + 1) / 12.0
@@ -139,54 +141,62 @@ class HeadCensus:
         """
         block = self.model.transformer.blocks[layer_idx]
         B, N, C = x.shape
-        
+
         # 1. Get QKV and split into heads
         # DINOv2 uses a combined linear layer for QKV
-        qkv = block.attn.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        qkv = (
+            block.attn.qkv(x)
+            .reshape(B, N, 3, self.num_heads, self.head_dim)
+            .permute(2, 0, 3, 1, 4)
+        )
         q, k, v = qkv[0], qkv[1], qkv[2]
 
         # 2. Standard Attention calculation
         attn = (q @ k.transpose(-2, -1)) * (self.head_dim**-0.5)
         attn = attn.softmax(dim=-1)
-        
+
         # 3. Context vector (weighted sum of values)
         # Shape: (B, num_heads, N, head_dim)
-        head_outputs = attn @ v 
-        
+        head_outputs = attn @ v
+
         # 4. Project each head back to the embedding dimension (C)
-        # The block.attn.proj is the W_O matrix. We must apply the relevant 
+        # The block.attn.proj is the W_O matrix. We must apply the relevant
         # slice of W_O to each head's output.
-        proj_weight = block.attn.proj.weight # Shape: (C, C)
+        proj_weight = block.attn.proj.weight  # Shape: (C, C)
         # Reshape weights to (num_heads, head_dim, C) to process heads individually
-        proj_weight_per_head = proj_weight.view(C, self.num_heads, self.head_dim).permute(1, 2, 0)
-        
+        proj_weight_per_head = proj_weight.view(
+            C, self.num_heads, self.head_dim
+        ).permute(1, 2, 0)
+
         # head_outputs: (B, H, N, D) @ proj_weight_per_head: (H, D, C)
         # Result: (B, H, N, C)
-        out_per_head = torch.einsum('bhnd,hdc->bhnc', head_outputs, proj_weight_per_head)
-        
+        out_per_head = torch.einsum(
+            "bhnd,hdc->bhnc", head_outputs, proj_weight_per_head
+        )
+
         # 5. Compute Norm (Magnitude of the contribution)
         # We take the mean norm across Batch and Token dimensions
-        contribution = torch.norm(out_per_head, p=2, dim=-1) # (B, H, N)
-        return contribution.mean(dim=(0, 2)) # (H,)
+        contribution = torch.norm(out_per_head, p=2, dim=-1)  # (B, H, N)
+        return contribution.mean(dim=(0, 2))  # (H,)
 
-    
     def run_census(self, dataloader, num_batches=10):
         self.model.eval()
         torch.set_grad_enabled(True)
         criterion = torch.nn.CrossEntropyLoss()
 
         for b_idx, (images, labels) in enumerate(tqdm(dataloader, desc="Census")):
-            if b_idx >= num_batches: break
+            if b_idx >= num_batches:
+                break
             images, labels = images.to(self.device), labels.to(self.device)
-            
+
             # 1. Forward pass & collect maps for Rollout
-            layer_attns = [] # To store (B, H, N, N) per layer
+            layer_attns = []  # To store (B, H, N, N) per layer
             x = self.model.transformer.prepare_tokens_with_masks(images)
-            
+
             for i in range(self.num_layers):
                 attn_map, _ = self.get_attention_map(x, i)
                 layer_attns.append(attn_map)
-                
+
                 with torch.no_grad():
                     # (0) Entropy
                     self.head_metrics[0, i] += compute_entropy(attn_map)
@@ -200,11 +210,11 @@ class HeadCensus:
             # 2. Compute Rollout (Metric 2)
             # Stack to (L, B, H, N, N)
             stacked_attns = torch.stack(layer_attns)
-            rollout_maps = compute_attention_rollout(stacked_attns) # (L, B, N, N)
-            
+            rollout_maps = compute_attention_rollout(stacked_attns)  # (L, B, N, N)
+
             with torch.no_grad():
                 for i in range(self.num_layers):
-                    # We average the rollout flow map for that layer 
+                    # We average the rollout flow map for that layer
                     # Note: Rollout is N x N, we take the mean "influence" per layer
                     self.head_metrics[2, i] += rollout_maps[i].mean()
 
@@ -219,7 +229,15 @@ class HeadCensus:
             self.head_metrics[idx] /= num_batches
 
     def plot_results(self, task_name):
-        metric_names = ["Entropy", "Distance", "Rollout", "Depth", "Res_Contrib", "Taylor Importance", "Intra-Layer Rank"]
+        metric_names = [
+            "Entropy",
+            "Distance",
+            "Rollout",
+            "Depth",
+            "Res_Contrib",
+            "Taylor Importance",
+            "Intra-Layer Rank",
+        ]
         fig, axes = plt.subplots(1, 7, figsize=(30, 5))
         fig.suptitle(f"Head Census - {task_name}", fontsize=16)
 
@@ -248,6 +266,12 @@ def main():
         choices=["classification", "detection", "segmentation"],
         help="Downstream task to evaluate [cite: 40]",
     )
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default="imagenet100",
+        help="cifar10, imagenet, imagenet100, etc.",
+    )
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument(
         "--samples",
@@ -274,7 +298,10 @@ def main():
     # Load Task-Specific Model and Dataloader
     if args.task == "classification":
         # Initialize the DINOv2-based classifier
-        model = DinoClassifier(device=device, num_classes=10).to(device)
+        _, dataloader, num_classes = get_loaders(
+            args.dataset, args.data_dir, args.batch_size, num_workers=2
+        )
+        model = DinoClassifier(device=device, num_classes=num_classes).to(device)
 
         # Load the trained linear probe weights
         if os.path.exists(args.checkpoint):
@@ -285,9 +312,6 @@ def main():
             print(
                 f"Warning: Checkpoint {args.checkpoint} not found. Running with random head."
             )
-
-        # Retrieve loaders using the helper from classification.py
-        dataloader, _, _ = get_loaders("cifar10", args.data_dir, args.batch_size, num_workers=2)
 
     else:
         # Placeholder for Task 2 and 3 implementation
