@@ -24,11 +24,6 @@ def compute_entropy(attn_map):
     Computes average attention entropy: -sum(p * log(p)).
     attn_map shape: (B, H, N, N)
     """
-    # skip the cls and register tokens
-    attn_map = attn_map[:, :, 5:, 5:]
-    # renormalize
-    attn_map = attn_map / (attn_map.sum(dim=-1, keepdim=True) + 1e-8)
-
     # Sum over the last dimension (key tokens)
     entropy = -torch.sum(
         attn_map * torch.log(attn_map + 1e-8), dim=-1
@@ -56,8 +51,8 @@ def compute_distance(attn_map, grid_size=16):
     # Skip the 1 CLS token AND the 4 Register tokens - Slice from index 5 to the end to isolate the 256 patch tokens
     attn_patches = attn_map[:, :, 5:, 5:]  # Now (B, H, 256, 256)
 
-    # renormalization
-    attn_patches = attn_patches / (attn_patches.sum(dim=-1, keepdim=True) + 1e-8)
+    """# renormalization
+    attn_patches = attn_patches / (attn_patches.sum(dim=-1, keepdim=True) + 1e-8)"""
 
     # Weighted average distance per head
     avg_dist = torch.sum(attn_patches * dists, dim=-1)  # (B, H, 256)
