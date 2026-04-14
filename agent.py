@@ -106,12 +106,17 @@ class PruningEnv:
         # Evaluate new accuracy after pruning
         _, new_acc = self.validator.evaluate(self.mask)
 
-        # Calculate Reward: accuracy * (1 - (current FLOPs / base FLOPs))
+        # # Calculate Reward: accuracy * (1 - (current FLOPs / base FLOPs))
         flops_ratio = get_flops_ratio(self.mask)
-        reward = (new_acc / 100.0) * (1.0 - flops_ratio)
+        # reward = (new_acc / 100.0) * (1.0 - flops_ratio)
+
+        # Simple Delta-Accuracy Reward (FLOPS drop is constant per action, don't work if idle actions are possible)
+        reward = new_acc - self.current_acc
+        # Optional: Add a tiny survival bonus so the agent slightly prefers state stability
+        reward += 0.05
 
         print(
-            f"   -> Step {self.steps}: Pruned Head {action_idx} | New Acc: {new_acc:.2f}% | FLOPs Ratio: {flops_ratio:.4f} | Active Heads: {int(self.mask.sum().item())}"
+            f"   -> Step {self.steps}: Pruned Head {action_idx} | New Acc: {new_acc:.2f}% | FLOPs Ratio: {flops_ratio:.4f} | Reward: {reward:.4f}"
         )
 
         self.current_acc = new_acc
