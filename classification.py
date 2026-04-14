@@ -137,7 +137,7 @@ def get_loaders(dataset_name, data_dir, batch_size, num_workers):
         num_classes = 10
 
     elif dataset_name.startswith("imagenet"):
-        # Dynamically extract the number of classes requested (default to 1000 if just 'imagenet')
+        # Dynamically extract the number of classes requested
         if dataset_name == "imagenet":
             num_classes = 1000
         else:
@@ -146,41 +146,48 @@ def get_loaders(dataset_name, data_dir, batch_size, num_workers):
                 num_classes = int(match.group(1))
             else:
                 raise ValueError(
-                    f"Invalid dataset name format: {dataset_name}. Use 'imagenet' or 'imagenetX' (e.g., imagenet100)."
+                    f"Invalid dataset name format: {dataset_name}. Use 'imagenet' or 'imagenetX'."
                 )
 
-        # Resolve paths for HPC Kaggle format vs standard format
+        # We ONLY look at the 'train' folder since the 'val' folder on the HPC is flat/unstructured
         hpc_train = os.path.join(data_dir, "ILSVRC/Data/CLS-LOC/train")
-        hpc_val = os.path.join(data_dir, "ILSVRC/Data/CLS-LOC/val")
         std_train = os.path.join(data_dir, "train")
-        std_val = os.path.join(data_dir, "val")
 
         if os.path.exists(hpc_train):
-            train_dir, val_dir = hpc_train, hpc_val
+            train_dir = hpc_train
         elif os.path.exists(std_train):
-            train_dir, val_dir = std_train, std_val
+            train_dir = std_train
         else:
-            raise FileNotFoundError(f"Could not find train/val folders in {data_dir}.")
+            raise FileNotFoundError(
+                f"Could not find structured train folder in {data_dir}."
+            )
 
-        print(f"Loading base ImageNet from {train_dir} and {val_dir}...")
-        train_set = torchvision.datasets.ImageFolder(
+        print(f"Loading structured ImageNet from {train_dir}...")
+        full_dataset = torchvision.datasets.ImageFolder(
             train_dir, transform=base_transform
         )
-        test_set = torchvision.datasets.ImageFolder(val_dir, transform=base_transform)
 
         # Subsetting logic: Keep only the first `num_classes`
         if num_classes < 1000:
             print(f"Subsetting ImageNet to the first {num_classes} classes...")
             valid_indices = set(range(num_classes))
 
-            # Filter samples and targets directly
-            train_set.samples = [s for s in train_set.samples if s[1] in valid_indices]
-            train_set.targets = [t for t in train_set.targets if t in valid_indices]
-            train_set.classes = train_set.classes[:num_classes]
+            full_dataset.samples = [
+                s for s in full_dataset.samples if s[1] in valid_indices
+            ]
+            full_dataset.targets = [
+                t for t in full_dataset.targets if t in valid_indices
+            ]
+            full_dataset.classes = full_dataset.classes[:num_classes]
 
-            test_set.samples = [s for s in test_set.samples if s[1] in valid_indices]
-            test_set.targets = [t for t in test_set.targets if t in valid_indices]
-            test_set.classes = test_set.classes[:num_classes]
+        # Create a robust 90/10 split from the structured data
+        print("Creating a 90/10 Train/Validation split...")
+        train_size = int(0.9 * len(full_dataset))
+        val_size = len(full_dataset) - train_size
+
+        train_set, test_set = torch.utils.data.random_split(
+            full_dataset, [train_size, val_size]
+        )
 
     else:
         raise ValueError(f"Dataset {dataset_name} not supported.")
