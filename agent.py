@@ -16,6 +16,7 @@ import argparse
 import os
 import re
 import numpy as np
+import matplotlib.pyplot as plt
 
 from classification import DinoClassifier, validate, get_loaders
 from rl_utils import get_flops_ratio, get_proxy_loader, FastProxyValidator
@@ -272,11 +273,46 @@ class AdvancedActorCritic(nn.Module):
 
         return Categorical(probs), value
 
+def save_training_plots(history, save_path):
+    """
+    Generates and saves a figure with Return, Entropy, and KL Divergence.
+    """
+    epochs = range(1, len(history["episodic_return"]) + 1)
+    
+    fig, axs = plt.subplots(1, 3, figsize=(18, 5))
+    
+    # 1. Episodic Return
+    axs[0].plot(epochs, history["episodic_return"], color='tab:blue', linewidth=1.5)
+    axs[0].set_title("Total Episodic Return")
+    axs[0].set_xlabel("Episode")
+    axs[0].set_ylabel("Sum of Rewards")
+    axs[0].grid(True, alpha=0.3)
+
+    # 2. Entropy (Exploration)
+    axs[1].plot(epochs, history["entropy"], color='tab:green', linewidth=1.5)
+    axs[1].set_title("Policy Entropy")
+    axs[1].set_xlabel("Episode")
+    axs[1].set_ylabel("Entropy Score")
+    axs[1].grid(True, alpha=0.3)
+
+    # 3. KL Divergence (Stability)
+    axs[2].plot(epochs, history["approx_kl"], color='tab:red', linewidth=1.5)
+    axs[2].axhline(y=0.02, color='gray', linestyle='--', label='Target Max') # Reference line
+    axs[2].set_title("Approx. KL Divergence")
+    axs[2].set_xlabel("Episode")
+    axs[2].set_ylabel("KL")
+    axs[2].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(save_path)
+    plt.close() # Close to free up memory
 
 # ----------------- TRAINING LOGIC -----------------
 
 
 def train_ppo(args):
+    plot_dir = os.path.join(args.save_dir, "figure_metrics")
+    os.makedirs(plot_dir, exist_ok=True)
     device = torch.device(
         args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu")
     )
@@ -318,6 +354,11 @@ def train_ppo(args):
 
     print("Starting PPO Training Loop...")
     for episode in range(args.episodes):
+        history = {
+            "episodic_return": [],
+            "entropy": [],
+            "approx_kl": []
+        }
         print(f"\n--- Episode {episode+1}/{args.episodes} ---")
         state_dict = env.reset()
         grids, scalars, masks, actions, log_probs, rewards, values = (
@@ -353,6 +394,10 @@ def train_ppo(args):
             if done:
                 break
 
+        # Metric 1: Total Return (Not discounted)
+        total_return = sum(rewards)
+        history["episodic_return"].append(total_return)
+
         # 2. Compute Returns and Advantages
         returns = []
         discounted_reward = 0
@@ -373,10 +418,29 @@ def train_ppo(args):
         old_actions = torch.stack(actions)
         old_log_probs = torch.stack(log_probs).detach()
 
+        # METRIC 2-3: KL divergence and Entropy
+        epoch_kls = []
+        epoch_entropies = []
+
         for _ in range(5):  # Optimize for K epochs
             dist, val = policy(old_grids, old_scalars, old_masks)
             new_log_probs = dist.log_prob(old_actions)
             entropy = dist.entropy().mean()
+
+            # --- CALCULATE METRICS ---
+        
+            # Entropy: Measures how much the agent is exploring
+            entropy = dist.entropy().mean()
+            
+            # Approximate KL Divergence: log(q/p) where q is new policy and p is old
+            # A common robust formula: mean((log_p_old - log_p_new) + (exp(log_p_new - log_p_old) - 1))
+            log_ratio = new_log_probs - old_log_probs
+            approx_kl = ((torch.exp(log_ratio) - 1) - log_ratio).mean()
+            
+            epoch_kls.append(approx_kl.item())
+            epoch_entropies.append(entropy.item())
+
+            # --- LOSS CALCULATION ---
 
             # Policy Loss (Clipped)
             ratio = torch.exp(new_log_probs - old_log_probs)
@@ -393,10 +457,13 @@ def train_ppo(args):
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+        # Log the average of the K epochs for this episode
+        history["entropy"].append(np.mean(epoch_entropies))
+        history["approx_kl"].append(np.mean(epoch_kls))
 
         # --- SAVE LOGIC ---
         avg_reward = sum(rewards) / len(rewards)
-
+        
         # Save "Latest" model
         torch.save(
             policy.state_dict(), os.path.join(args.save_dir, "surgeon_ppo_latest.pth")
@@ -413,6 +480,11 @@ def train_ppo(args):
         print(
             f"Final Step Acc: {env.current_acc:.2f}% | Avg Reward: {avg_reward:.4f} | Loss: {loss.item():.4f}"
         )
+
+        if (episode + 1) % 1 == 0:
+            plot_path = os.path.join(plot_dir, f"metrics_ep_{episode+1}.png")
+            save_training_plots(history, plot_path)
+            print(f"   -> Plot saved to {plot_path}")
 
 
 if __name__ == "__main__":
