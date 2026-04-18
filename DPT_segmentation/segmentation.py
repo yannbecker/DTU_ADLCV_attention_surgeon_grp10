@@ -1,3 +1,4 @@
+# From classification.py
 import torch
 import torch.nn as nn
 import torchvision
@@ -10,15 +11,17 @@ import matplotlib.pyplot as plt
 import os
 import argparse
 
+# From DPT-paper repository
+from models import DPTSegmentationModel
+from torchmetrics.classification import MulticlassJaccardIndex
 
-class DinoSegmenter(nn.Module):
+
+class DinoSegmenter(DPTSegmentationModel):
     
-    def __init__(self, device, num_classes=10):
-        super(DinoClassifier, self).__init__()
-        self.transformer = load_model(device) # Backbone Dinov2
+    def __init__(self, device):
 
         # Freeze the backbone for linear probing [cite: 40, 44]
-        for param in self.transformer.parameters():
+        for param in self.pretrained.model.parameters():
             param.requires_grad = False
 
         # Equivalent de self.classifier = nn.Linear(768, num_classes)
@@ -56,7 +59,7 @@ class DinoSegmenter(nn.Module):
         # Attach hooks to each of the 12 blocks [cite: 28]
         for i in range(12):
             # We hook the 'attn' layer's output
-            layer = self.transformer.blocks[i].attn
+            layer = self.pretrained.model.blocks[i].attn
             # Use a closure to pass the layer index
             handle = layer.register_forward_hook(
                 lambda mod, inp, out, idx=i: hook_fn(mod, inp, out, idx)
@@ -70,20 +73,18 @@ class DinoSegmenter(nn.Module):
         """
         self.mask = mask_1d.view(12, 12)
 
-    def forward(self, x):
-        # DINOv2 returns the CLS token by default in this configuration
-        features = self.transformer(x)
-        logits = self.classifier(features)
-        return logits
 
-def train_one_epoch(model, loader, criterion, optimizer, device):
+def train_one_epoch(model, loader, criterion, optimizer, device, gamma = 0.1, with_loss_aux = False):
     model.train()
     running_loss = 0.0
-    for images, labels in tqdm(loader, desc="Training", leave=False):
-        images, labels = images.to(device), labels.to(device)
+    
+    for images, masks in tqdm(loader, desc="Training", leave=False): # A MODIFIER -> ADE20K
+        images, masks = images.to(device), masks.to(device)
 
-        outputs = model(images)
-        loss = criterion(outputs, labels)
+        path2, outputs = model(images) # model = DPTSegmenter
+        aux_outputs = model.auxlayer(path2) 
+        loss = criterion(outputs, masks) + (gamma*criterion(aux_outputs, masks) if with_loss_aux else 0) # A MODIFIER / VERIFIER
+        
 
         optimizer.zero_grad()
         loss.backward()
@@ -93,24 +94,30 @@ def train_one_epoch(model, loader, criterion, optimizer, device):
     return running_loss / len(loader)
 
 
-def validate(model, loader, criterion, device):
+def validate(
+        model, 
+        loader, 
+        criterion, 
+        device, 
+        miou_metric,  # A MODIFIER -> Initialiser un metric MulticlassJaccardIndex de torchmetrics
+        gamma=0.1, 
+        with_loss_aux=False
+             ):
     model.eval()
     running_loss = 0.0
-    correct = 0
-    total = 0
     with torch.no_grad():
-        for images, labels in tqdm(loader, desc="Validating", leave=False):
-            images, labels = images.to(device), labels.to(device)
-            outputs = model(images)
-            loss = criterion(outputs, labels)
+        for images, masks in tqdm(loader, desc="Validating", leave=False):
+            images, masks = images.to(device), masks.to(device)
+            path2, outputs = model(images)
+            loss = criterion(outputs, masks) + (gamma * criterion(model.auxlayer(path2), masks) if with_loss_aux else 0) # A MODIFIER / VERIFIER
             running_loss += loss.item()
 
-            _, predicted = outputs.max(1)
-            total += labels.size(0)
-            correct += predicted.eq(labels).sum().item()
+            # Update of the mIoU metric
+            # outputs: [B, C, H, W], masks: [B, H, W]
+            miou_metric.update(outputs, masks)
 
-    mIoU = None # A MODIFIER : Mean Intersection over Union
-    return running_loss / len(loader), mIoU
+    Final_mIoU = miou_metric.compute().item() # A MODIFIER / VERIFIER
+    return running_loss / len(loader), Final_mIoU
 
 
 def get_loaders(data_dir, batch_size, num_workers):
