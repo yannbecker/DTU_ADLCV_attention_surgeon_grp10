@@ -468,14 +468,20 @@ def train_ppo(args):
 
         # Save "Latest" model
         torch.save(
-            policy.state_dict(), os.path.join(args.save_dir, "surgeon_ppo_latest.pth")
+            policy.state_dict(),
+            os.path.join(
+                args.save_dir, f"surgeon_ppo_latest_{args.max_pruning}prune.pth"
+            ),
         )
 
         # Save "Best" model based on total episode reward
         if avg_reward > best_reward:
             best_reward = avg_reward
             torch.save(
-                policy.state_dict(), os.path.join(args.save_dir, "surgeon_ppo_best.pth")
+                policy.state_dict(),
+                os.path.join(
+                    args.save_dir, f"surgeon_ppo_best_{args.max_pruning}prune.pth"
+                ),
             )
             print(f"   *** New Best Reward! ({best_reward:.4f}) ***")
 
