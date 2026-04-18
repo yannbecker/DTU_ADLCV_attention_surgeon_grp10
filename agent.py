@@ -273,31 +273,34 @@ class AdvancedActorCritic(nn.Module):
 
         return Categorical(probs), value
 
+
 def save_training_plots(history, save_path):
     """
     Generates and saves a figure with Return, Entropy, and KL Divergence.
     """
     epochs = range(1, len(history["episodic_return"]) + 1)
-    
+
     fig, axs = plt.subplots(1, 3, figsize=(18, 5))
-    
+
     # 1. Episodic Return
-    axs[0].plot(epochs, history["episodic_return"], color='tab:blue', linewidth=1.5)
+    axs[0].plot(epochs, history["episodic_return"], color="tab:blue", linewidth=1.5)
     axs[0].set_title("Total Episodic Return")
     axs[0].set_xlabel("Episode")
     axs[0].set_ylabel("Sum of Rewards")
     axs[0].grid(True, alpha=0.3)
 
     # 2. Entropy (Exploration)
-    axs[1].plot(epochs, history["entropy"], color='tab:green', linewidth=1.5)
+    axs[1].plot(epochs, history["entropy"], color="tab:green", linewidth=1.5)
     axs[1].set_title("Policy Entropy")
     axs[1].set_xlabel("Episode")
     axs[1].set_ylabel("Entropy Score")
     axs[1].grid(True, alpha=0.3)
 
     # 3. KL Divergence (Stability)
-    axs[2].plot(epochs, history["approx_kl"], color='tab:red', linewidth=1.5)
-    axs[2].axhline(y=0.02, color='gray', linestyle='--', label='Target Max') # Reference line
+    axs[2].plot(epochs, history["approx_kl"], color="tab:red", linewidth=1.5)
+    axs[2].axhline(
+        y=0.02, color="gray", linestyle="--", label="Target Max"
+    )  # Reference line
     axs[2].set_title("Approx. KL Divergence")
     axs[2].set_xlabel("Episode")
     axs[2].set_ylabel("KL")
@@ -305,7 +308,8 @@ def save_training_plots(history, save_path):
 
     plt.tight_layout()
     plt.savefig(save_path)
-    plt.close() # Close to free up memory
+    plt.close()  # Close to free up memory
+
 
 # ----------------- TRAINING LOGIC -----------------
 
@@ -352,13 +356,11 @@ def train_ppo(args):
     os.makedirs(args.save_dir, exist_ok=True)
     best_reward = -float("inf")
 
+    # Initialize history for plotting
+    history = {"episodic_return": [], "entropy": [], "approx_kl": []}
+
     print("Starting PPO Training Loop...")
     for episode in range(args.episodes):
-        history = {
-            "episodic_return": [],
-            "entropy": [],
-            "approx_kl": []
-        }
         print(f"\n--- Episode {episode+1}/{args.episodes} ---")
         state_dict = env.reset()
         grids, scalars, masks, actions, log_probs, rewards, values = (
@@ -428,15 +430,15 @@ def train_ppo(args):
             entropy = dist.entropy().mean()
 
             # --- CALCULATE METRICS ---
-        
+
             # Entropy: Measures how much the agent is exploring
             entropy = dist.entropy().mean()
-            
+
             # Approximate KL Divergence: log(q/p) where q is new policy and p is old
             # A common robust formula: mean((log_p_old - log_p_new) + (exp(log_p_new - log_p_old) - 1))
             log_ratio = new_log_probs - old_log_probs
             approx_kl = ((torch.exp(log_ratio) - 1) - log_ratio).mean()
-            
+
             epoch_kls.append(approx_kl.item())
             epoch_entropies.append(entropy.item())
 
@@ -463,7 +465,7 @@ def train_ppo(args):
 
         # --- SAVE LOGIC ---
         avg_reward = sum(rewards) / len(rewards)
-        
+
         # Save "Latest" model
         torch.save(
             policy.state_dict(), os.path.join(args.save_dir, "surgeon_ppo_latest.pth")
