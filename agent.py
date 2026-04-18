@@ -481,7 +481,7 @@ def train_ppo(args):
             f"Final Step Acc: {env.current_acc:.2f}% | Avg Reward: {avg_reward:.4f} | Loss: {loss.item():.4f}"
         )
 
-        if (episode + 1) % 1 == 0:
+        if (episode + 1) % 10 == 0:
             plot_path = os.path.join(plot_dir, f"metrics_ep_{episode+1}.png")
             save_training_plots(history, plot_path)
             print(f"   -> Plot saved to {plot_path}")
