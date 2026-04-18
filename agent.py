@@ -490,7 +490,9 @@ def train_ppo(args):
         )
 
         if (episode + 1) % 10 == 0:
-            plot_path = os.path.join(plot_dir, f"metrics_ep_{episode+1}.png")
+            plot_path = os.path.join(
+                plot_dir, f"metrics_ep_{episode+1}_{args.max_pruning}prune.png"
+            )
             save_training_plots(history, plot_path)
             print(f"   -> Plot saved to {plot_path}")
 
