@@ -84,7 +84,7 @@ def main(args):
     plt.figure(figsize=(10, 6))
     plt.plot(
         x_vals,
-        y_vals,
+        rl_y_vals,
         marker="o",
         linestyle="-",
         color="tab:blue",
