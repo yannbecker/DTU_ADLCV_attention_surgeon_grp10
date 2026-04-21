@@ -35,35 +35,29 @@ class DinoClassifier(nn.Module):
 
     def _register_pruning_hooks(self):
         """
-        Registers hooks to zero out head outputs during forward pass.
-        ViT-B/14 has 768 dim / 12 heads = 64 dim per head.
+        Registers PRE-hooks to zero out head outputs BEFORE they are mixed
+        by the projection matrix. This better simulates physical pruning.
         """
 
-        def hook_fn(module, input, output, layer_idx):
-            # The output of DINOv2 attention is (Batch, Tokens, 768)
-            # We reshape the mask for this layer to (1, 1, 12, 1) -> (Batch, Tokens, Heads, HeadDim)
-            # However, it's simpler to just zero out the 64-dim slices.
+        def pre_hook_fn(module, inp, layer_idx):
+            # inp is a tuple containing the input tensor to the proj layer
+            # Shape of inp[0]: (B, N, 768) -> The concatenated, unmixed heads
             mask_layer = self.mask[layer_idx]  # Shape: (12,)
+            full_mask = mask_layer.repeat_interleave(64).to(inp[0].device)
 
-            # Create a 768-dim binary mask for this specific layer
-            # Each '1' or '0' in mask_layer is expanded to 64 dimensions
-            full_mask = mask_layer.repeat_interleave(64).to(output.device)
-
-            # Apply the mask to the output tensor
-            return output * full_mask
+            # We zero out the specific head's columns before the matrix multiplication
+            return (inp[0] * full_mask,)
 
         # Clear existing hooks if any
         for h in self.hooks:
             h.remove()
         self.hooks = []
 
-        # Attach hooks to each of the 12 blocks [cite: 28]
+        # Attach pre-hooks to the 'proj' layer of each block
         for i in range(12):
-            # We hook the 'attn' layer's output
-            layer = self.transformer.blocks[i].attn
-            # Use a closure to pass the layer index
-            handle = layer.register_forward_hook(
-                lambda mod, inp, out, idx=i: hook_fn(mod, inp, out, idx)
+            layer = self.transformer.blocks[i].attn.proj
+            handle = layer.register_forward_pre_hook(
+                lambda mod, inp, idx=i: pre_hook_fn(mod, inp, idx)
             )
             self.hooks.append(handle)
 
@@ -85,7 +79,7 @@ class DinoClassifier(nn.Module):
             self.transformer.blocks[layer_idx].attn.requires_grad_(requires_grad)
 
     def get_taylor_importance(self, images, labels, criterion):
-        self.eval() 
+        self.eval()
         taylor_scores = torch.zeros(12, 12).to(images.device)
         activations = {}
         grads = {}
@@ -94,16 +88,19 @@ class DinoClassifier(nn.Module):
             def hook(model, input, output):
                 # CRITICAL FIX: The output of a frozen layer has requires_grad=False.
                 # We force it to True so we can register a hook and compute Taylor importance.
-                output.requires_grad_(True) 
+                output.requires_grad_(True)
                 activations[name] = output.detach()
                 output.register_hook(lambda g: grads.update({name: g}))
+
             return hook
 
         # 1. Attach temporary hooks
         temp_hooks = []
         for i in range(12):
             # Using the existing transformer blocks
-            h = self.transformer.blocks[i].attn.register_forward_hook(save_activation(f"layer_{i}"))
+            h = self.transformer.blocks[i].attn.register_forward_hook(
+                save_activation(f"layer_{i}")
+            )
             temp_hooks.append(h)
 
         # 2. Forward pass (Inside a gradient-enabled context)
@@ -119,12 +116,12 @@ class DinoClassifier(nn.Module):
         for i in range(12):
             if f"layer_{i}" in grads:
                 act = activations[f"layer_{i}"]  # (B, N, 768)
-                grad = grads[f"layer_{i}"]       # (B, N, 768)
-                
+                grad = grads[f"layer_{i}"]  # (B, N, 768)
+
                 # Reshape to 12 heads
                 act = act.view(act.size(0), act.size(1), 12, 64)
                 grad = grad.view(grad.size(0), grad.size(1), 12, 64)
-                
+
                 # Sum over HeadDim (64) and average over Batch/Tokens
                 score = torch.abs((act * grad).sum(dim=-1)).mean(dim=(0, 1))
                 taylor_scores[i] = score
@@ -134,7 +131,7 @@ class DinoClassifier(nn.Module):
             h.remove()
 
         return taylor_scores
-    
+
     def get_intra_layer_ranks(self, taylor_importance_matrix):
         """
         Computes the relative rank of each head within its own layer.
@@ -142,15 +139,17 @@ class DinoClassifier(nn.Module):
         Output: (12, 12) matrix of normalized ranks [0, 1].
         """
         # taylor_importance_matrix shape: (Layers=12, Heads=12)
-        
+
         # 1. Get ranks: argsort twice gives the rank (0 to 11)
         # Higher importance = Higher rank index
-        ranks = torch.argsort(torch.argsort(taylor_importance_matrix, dim=1), dim=1).float()
-        
+        ranks = torch.argsort(
+            torch.argsort(taylor_importance_matrix, dim=1), dim=1
+        ).float()
+
         # 2. Normalize to [0, 1]
         # (Rank / (Num_Heads - 1)) -> 0.0 is the least important, 1.0 is the most important
-        normalized_ranks = ranks / (self.num_heads - 1) 
-        
+        normalized_ranks = ranks / (self.num_heads - 1)
+
         return normalized_ranks
 
     def forward(self, x):
