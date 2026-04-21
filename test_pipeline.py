@@ -31,7 +31,7 @@ ANCHORS = torch.tensor([[0.28, 0.22], [0.38, 0.48], [0.90, 0.78]])
 
 def load_dino(device):
     print("  Loading DINOv2 ViT-B/14 from torch.hub …")
-    model = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitb14_reg')
+    model = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitb14_reg') # With reg token 
     return model.to(device)
 
 class MinimalDetector(nn.Module):
@@ -70,7 +70,7 @@ class MinimalDetector(nn.Module):
         x = self.transformer.prepare_tokens_with_masks(images)
         for blk in self.transformer.blocks: x = blk(x)
         x = self.transformer.norm(x)
-        patches = x[:, 1:, :]  # drop CLS
+        patches = x[:, 5:, :]  # drop CLS + 4 register tokens
         B = patches.size(0)
         return patches.permute(0, 2, 1).view(B, FEAT_DIM, GRID_SIZE, GRID_SIZE)
 
