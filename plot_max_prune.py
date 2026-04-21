@@ -133,7 +133,7 @@ def main(args):
         # Compute Magnitudes once
         print("Computing head magnitudes on calibration set...")
         magnitudes = compute_head_magnitudes(
-            model, train_loader, calib_batches=20, device=device
+            model, train_loader, num_batches=20, device=device
         )
 
         baseline_y_vals = []
