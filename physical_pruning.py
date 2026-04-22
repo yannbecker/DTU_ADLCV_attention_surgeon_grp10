@@ -214,7 +214,7 @@ def main(args):
     params_before = count_parameters(model.transformer)
     print(f"    Base ViT Parameters: {params_before:,}")
 
-    # 3. Load the RL Agent and Extract Mask
+    # 3. Load the RL Agent
     agent = AdvancedActorCritic(n_metrics=7).to(device)
     if os.path.exists(args.agent_checkpoint):
         agent.load_state_dict(torch.load(args.agent_checkpoint, map_location=device))
@@ -223,30 +223,34 @@ def main(args):
     else:
         raise FileNotFoundError(f"Agent Checkpoint {args.agent_checkpoint} not found.")
 
-    # Run the environment greedily to get the final mask
+    # 4. Generate and Save the Pruning Sequence Tensor
     env = PruningEnv(model, val_loader, device, max_pruning=args.max_prune)
-    state = env.reset()
+    print(
+        f"\nRunning RL Agent to generate surgical sequence for {args.max_prune} heads..."
+    )
 
-    print(f"\nRunning RL Agent to prune {args.max_prune} heads...")
-    with torch.no_grad():
-        for _ in range(args.max_prune):
-            # Deterministic selection (argmax) instead of sampling for the final evaluation
-            dist, _ = agent(state["metric_grid"], state["scalars"], state["mask"])
-            action = dist.probs.argmax()
-            state, _, done = env.step(action.item())
-            if done:
-                break
+    sequence_tensor = PhysicalPruner.generate_sequence_tensor(
+        agent, env, args.max_prune
+    )
 
-    final_mask_1d = env.mask.clone()
-    final_mask_12x12 = final_mask_1d.view(12, 12)
+    # Save the sequence tensor for your teammate's environmental study
+    study_dir = "environmental_study"
+    os.makedirs(study_dir, exist_ok=True)
+    seq_path = os.path.join(study_dir, f"sequence_{args.dataset}.pt")
+    torch.save(sequence_tensor, seq_path)
+    print(f"    [+] Pruning sequence tensor saved to {seq_path}")
 
-    # 4. Baseline Evaluation (Simulated Hooks)
+    # Extract the final mask for the validation steps below
+    final_mask_12x12 = PhysicalPruner.get_mask_for_step(sequence_tensor, args.max_prune)
+    final_mask_1d = final_mask_12x12.view(-1)
+
+    # 5. Baseline Evaluation (Simulated Hooks)
     print("\nEvaluating DINO with SIMULATED Pruning (Hooks)...")
     model.set_mask(final_mask_1d)
     _, sim_acc = validate(model, val_loader, nn.CrossEntropyLoss(), device)
     print(f"    -> Simulated Accuracy: {sim_acc:.2f}%")
 
-    # 5. Apply Physical Surgery
+    # 6. Apply Physical Surgery
     print("\nPerforming Physical Surgery on DINO Matrices...")
     PhysicalPruner.prune_model(model, final_mask_12x12)
 
@@ -254,24 +258,24 @@ def main(args):
     reduction = 100.0 * (params_before - params_after) / params_before
     print(f"    Pruned ViT Parameters: {params_after:,} (Reduced by {reduction:.1f}%)")
 
-    # 6. Final Evaluation (Physically Pruned)
+    # 7. Final Evaluation (Physically Pruned)
     print("\nEvaluating DINO with PHYSICAL Pruning...")
     _, phys_acc = validate(model, val_loader, nn.CrossEntropyLoss(), device)
     print(f"    -> Physical Accuracy:  {phys_acc:.2f}%")
 
-    # 7. Verification
+    # 8. Verification
     print("\n--- Summary ---")
     if abs(sim_acc - phys_acc) < 0.05:
         print("[SUCCESS] Physical accuracy matches Simulated accuracy perfectly.")
     else:
         print("[WARNING] Accuracy mismatch detected. Check tensor slicing logic.")
 
-    # Save the physically pruned model for the CO2/FLOP analysis
+    # Save the fully physically pruned model as a standalone baseline
     save_path = os.path.join(
         args.save_dir, f"physically_pruned_dino_{args.dataset}.pth"
     )
     torch.save(model.state_dict(), save_path)
-    print(f"\nPhysically pruned model saved to {save_path} for CO2/FLOP analysis.")
+    print(f"\nPhysically pruned model saved to {save_path}.")
 
 
 if __name__ == "__main__":
