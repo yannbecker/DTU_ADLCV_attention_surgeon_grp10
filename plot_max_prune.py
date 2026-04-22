@@ -217,6 +217,14 @@ def main(args):
     # ---------------------------------------------------------
     if args.baseline and all_x_vals:
         print(f"\n--- Running Baseline Sweep ---")
+        # Lock random seeds for reproducibility of the baseline
+        import random
+        import numpy as np
+
+        torch.manual_seed(42)
+        np.random.seed(42)
+        random.seed(42)
+
         # Ensure model is loaded if not already loaded by checkpoints mode
         if args.mode == "logs":
             train_loader, test_loader, num_classes = get_loaders(
