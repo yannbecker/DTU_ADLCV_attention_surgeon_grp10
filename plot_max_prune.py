@@ -327,7 +327,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--mode",
         type=str,
-        choices=["logs", "checkpoints"],
+        choices=["logs", "checkpoints", "single_checkpoint"],
         default="logs",
         help="Parse .out logs (fast) OR load agent checkpoints and evaluate full dataset (slow but accurate).",
     )
