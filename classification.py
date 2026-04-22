@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torchvision
 import torchvision.transforms as transforms
-from utils import load_model  # Adjusted import to your structure
+from Final_Project.DTU_ADLCV_attention_surgeon_grp10.DPT_segmentation.utils import load_model  # Adjusted import to your structure
 from torch.utils.data import DataLoader
 import torch.optim as optim
 from tqdm.auto import tqdm
@@ -163,7 +163,7 @@ def main(args):
     model = DinoClassifier(device, num_classes=10).to(device)
     os.makedirs(args.checkpoint_dir, exist_ok=True)
 
-    criterion = nn.CrossEntropyLoss()
+    criterion = nn.CrossEntropyLoss(ignore_index=-1)
     optimizer = optim.Adam(model.classifier.parameters(), lr=args.lr)
 
     train_losses, val_losses = [], []

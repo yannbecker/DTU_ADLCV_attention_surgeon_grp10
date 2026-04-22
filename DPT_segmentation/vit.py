@@ -3,7 +3,7 @@ import torch.nn as nn
 import types
 import math
 import torch.nn.functional as F
-from ..utils import load_model # Load DINOv2 function
+from utils import load_model # Load DINOv2 function
 
 activations = {}
 
@@ -137,9 +137,13 @@ def forward_vit(pretrained, x):
         layer_4 = unflatten(layer_4)
 
     layer_1 = pretrained.act_postprocess1[3 : len(pretrained.act_postprocess1)](layer_1)
+    #print(f"Shape after postprocessing layer_1: {layer_1.shape}")
     layer_2 = pretrained.act_postprocess2[3 : len(pretrained.act_postprocess2)](layer_2)
+    #print(f"Shape after postprocessing layer_2: {layer_2.shape}")
     layer_3 = pretrained.act_postprocess3[3 : len(pretrained.act_postprocess3)](layer_3)
+    #print(f"Shape after postprocessing layer_3: {layer_3.shape}")
     layer_4 = pretrained.act_postprocess4[3 : len(pretrained.act_postprocess4)](layer_4)
+    #print(f"Shape after postprocessing layer_4: {layer_4.shape}")
 
     return layer_1, layer_2, layer_3, layer_4
 
@@ -175,7 +179,9 @@ def forward_flex(self, x):
         if isinstance(x, (list, tuple)):
             x = x[-1]  # last feature if backbone outputs list/tuple of features
 
+    #print(f"Shape after patch embedding: {x.shape}")
     x = self.patch_embed.proj(x).flatten(2).transpose(1, 2)
+    #print(f"Shape after patch projection: {x.shape}")
 
     if getattr(self, "dist_token", None) is not None:
         cls_tokens = self.cls_token.expand(
@@ -190,13 +196,13 @@ def forward_flex(self, x):
         x = torch.cat((cls_tokens, x), dim=1)
 
     x = x + pos_embed
-    x = self.pos_drop(x)
+    # x = self.pos_drop(x) No dropout here for DINOv2
 
     for blk in self.blocks:
         x = blk(x)
 
     x = self.norm(x)
-
+    #print(f"Shape after transformer blocks: {x.shape}")
     return x
 
 
@@ -219,7 +225,7 @@ def get_readout_oper(vit_features, features, use_readout, start_index=1):
 
 def _make_vit_b14_backbone(
     model,
-    features= [96, 192, 384, 768], # A MODIFIER / VERIFIER -> Est ce qu'on veut un multiple de 12 ou bien un multiple de 14 ?
+    features= [96, 192, 384, 768], # A MODIFIER / VERIFIER -> Est ce qu'on veut un multiple de 12 ou bien un multiple de 14 
     size=[224, 224], # Modified for a vit_b14
     hooks=[2, 5, 8, 11],
     vit_features=768,
@@ -258,14 +264,14 @@ def _make_vit_b14_backbone(
     pretrained.act_postprocess1 = nn.Sequential( 
         readout_oper[0],
         Transpose(1, 2),
-        nn.Unflatten(2, torch.Size([size[0] // 14, size[1] // 14])), #14x14x16
+        nn.Unflatten(2, torch.Size([size[0] // 14, size[1] // 14])), # Bx768x16x16 : a 768 vector represents one of the 256 14x14 patches
         nn.Conv2d(
             in_channels=vit_features,
             out_channels=features[0],
-            kernel_size=1,
+            kernel_size=3,  #1     # Test : kernel_size=3, padding=1 -> Bx96x14x14
             stride=1,
             padding=0,
-        ),
+        ),  # Bx96x14x14
         nn.ConvTranspose2d(
             in_channels=features[0],
             out_channels=features[0],
@@ -275,7 +281,7 @@ def _make_vit_b14_backbone(
             bias=True,
             dilation=1,
             groups=1,
-        ),
+        ), # Bx96x56x56
     )
 
     pretrained.act_postprocess2 = nn.Sequential(
@@ -285,7 +291,7 @@ def _make_vit_b14_backbone(
         nn.Conv2d(
             in_channels=vit_features,
             out_channels=features[1],
-            kernel_size=1,
+            kernel_size=3,  #1     # Test : kernel_size=3, padding=1 -> Bx192x14x14
             stride=1,
             padding=0,
         ),
@@ -308,7 +314,7 @@ def _make_vit_b14_backbone(
         nn.Conv2d(
             in_channels=vit_features,
             out_channels=features[2],
-            kernel_size=1,
+            kernel_size=3,  #1     # Test : kernel_size=3, padding=1 -> Bx384x14x14
             stride=1,
             padding=0,
         ),
@@ -321,7 +327,7 @@ def _make_vit_b14_backbone(
         nn.Conv2d(
             in_channels=vit_features,
             out_channels=features[3],
-            kernel_size=1,
+            kernel_size=3,  #1     # Test : kernel_size=3, padding=1 -> Bx768x14x14
             stride=1,
             padding=0,
         ),

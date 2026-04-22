@@ -3,7 +3,6 @@ import torch
 import torch.nn as nn
 import torchvision
 import torchvision.transforms as transforms
-from utils import load_model  # Adjusted import to your structure
 from torch.utils.data import DataLoader
 import torch.optim as optim
 from tqdm.auto import tqdm
@@ -14,18 +13,20 @@ import argparse
 # From DPT-paper repository
 from models import DPTSegmentationModel
 from torchmetrics.classification import MulticlassJaccardIndex
+from dataloaders_segmentation import ADE20KMinimalDataset 
 
 
 class DinoSegmenter(DPTSegmentationModel):
-    
-    def __init__(self, device):
+
+    def __init__(self, device, **kwargs): # A MODIFIER / VERIFIER : argument num_classes ?
+
+        super().__init__(**kwargs) 
 
         # Freeze the backbone for linear probing [cite: 40, 44]
         for param in self.pretrained.model.parameters():
             param.requires_grad = False
 
-        # Equivalent de self.classifier = nn.Linear(768, num_classes)
-        self.segmenter = None # A MODIFIER
+        # Equivalent de self.classifier = nn.Linear(768, num_classes) ?
 
         # Internal state for the pruning mask (12 layers x 12 heads)
         self.mask = torch.ones(12, 12).to(device)
@@ -74,18 +75,15 @@ class DinoSegmenter(DPTSegmentationModel):
         self.mask = mask_1d.view(12, 12)
 
 
-def train_one_epoch(model, loader, criterion, optimizer, device, gamma = 0.1, with_loss_aux = False):
+def train_one_epoch(model, loader, criterion, optimizer, device, alpha = 0.2, with_loss_aux = False):
     model.train()
     running_loss = 0.0
     
     for images, masks in tqdm(loader, desc="Training", leave=False): # A MODIFIER -> ADE20K
         images, masks = images.to(device), masks.to(device)
-
         path2, outputs = model(images) # model = DPTSegmenter
         aux_outputs = model.auxlayer(path2) 
-        loss = criterion(outputs, masks) + (gamma*criterion(aux_outputs, masks) if with_loss_aux else 0) # A MODIFIER / VERIFIER
-        
-
+        loss = criterion(outputs, masks) + (alpha*criterion(aux_outputs, masks) if with_loss_aux else 0) # A MODIFIER / VERIFIER
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
@@ -100,7 +98,7 @@ def validate(
         criterion, 
         device, 
         miou_metric,  # A MODIFIER -> Initialiser un metric MulticlassJaccardIndex de torchmetrics
-        gamma=0.1, 
+        alpha=0.1, 
         with_loss_aux=False
              ):
     model.eval()
@@ -109,7 +107,12 @@ def validate(
         for images, masks in tqdm(loader, desc="Validating", leave=False):
             images, masks = images.to(device), masks.to(device)
             path2, outputs = model(images)
-            loss = criterion(outputs, masks) + (gamma * criterion(model.auxlayer(path2), masks) if with_loss_aux else 0) # A MODIFIER / VERIFIER
+            outputs_aux = model.auxlayer(path2)
+            loss = criterion(outputs, masks) + (alpha * criterion(outputs_aux, masks) if with_loss_aux else 0) # A MODIFIER / VERIFIER
+            # predict the class for each pixel and compute the loss
+            outputs = torch.argmax(outputs, dim=1) 
+            outputs_aux = torch.argmax(outputs_aux, dim=1)
+            
             running_loss += loss.item()
 
             # Update of the mIoU metric
@@ -121,26 +124,13 @@ def validate(
 
 
 def get_loaders(data_dir, batch_size, num_workers):
-    base_transform = transforms.Compose( # A MODIFIER -> Adapter à ADE2OK
-        [
-            transforms.Resize(224),
-            transforms.ToTensor(),
-            transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
-        ]
-    )
-    train_set = torchvision.datasets.CIFAR10( # A MODIFIER -> Adapter à ADE2OK
-        root=data_dir, train=True, download=True, transform=base_transform
-    )
-    test_set = torchvision.datasets.CIFAR10( # A MODIFIER -> Adapter à ADE2OK
-        root=data_dir, train=False, download=True, transform=base_transform
-    )
+    
+    img_dir = os.path.join(data_dir, 'images')
+    mask_dir = os.path.join(data_dir, 'annotations')
+    dataset = ADE20KMinimalDataset(img_dir=img_dir, mask_dir=mask_dir, size=(224, 224))
+    train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers)
+    test_loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
 
-    train_loader = DataLoader( # A MODIFIER -> Adapter à ADE2OK
-        train_set, batch_size=batch_size, shuffle=True, num_workers=num_workers
-    )
-    test_loader = DataLoader( # A MODIFIER -> Adapter à ADE2OK
-        test_set, batch_size=batch_size, shuffle=False, num_workers=num_workers
-    )
     return train_loader, test_loader
 
 
@@ -148,54 +138,63 @@ def get_loaders(data_dir, batch_size, num_workers):
 
 
 def main(args):
-    device = (
-        args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu")
-    )
+
+    # -------------------- DEVICE SETUP
+    if args.device:
+        device = args.device
+    elif torch.cuda.is_available():
+        device = "cuda"
+    elif torch.backends.mps.is_available():
+        device = "mps"
+    else:        
+        device = "cpu"
+    
     print(f"Using device: {device}")
 
     # ------------------- DATASET SETUP
-    base_transform = transforms.Compose( # A MODIFIER -> Adapter à ADE2OK
-        [
-            transforms.Resize(224),
-            transforms.ToTensor(),
-            transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
-        ]
-    )
 
     train_loader, test_loader = get_loaders(
         args.data_dir, args.batch_size, args.num_workers
     )
 
     # ------------------- MODEL SETUP
-    model = DinoClassifier(device, num_classes=10).to(device) # A MODIFIER -> DinoSegmenter
+    model = DinoSegmenter(device, num_classes=150).to(device) 
     os.makedirs(args.checkpoint_dir, exist_ok=True)
 
-    criterion = nn.CrossEntropyLoss() # A MODIFIER -> Vérifier que c'est bien la CE loss
-    optimizer = optim.Adam(model.classifier.parameters(), lr=args.lr) # A MODIFIER -> Est ce qu'on utilise Adam
+    criterion = nn.CrossEntropyLoss(ignore_index=-1) 
+    # Remplacement de Adam par SGD avec Momentum
+    optimizer = optim.SGD(
+        model.parameters(), 
+        lr=args.lr, 
+        momentum=0.9, 
+        weight_decay=1e-4  # Valeur souvent utilisée dans DPT
+    )
 
     train_losses, val_losses = [], []
+    mIoU_metric = MulticlassJaccardIndex(num_classes=150, ignore_index=-1).to(device) # A MODIFIER / VERIFIER -> Attention à l'indice des classes, 0 = background dans ADE20K
 
     # ------------------- TRAINING LOOP
     for epoch in range(args.epochs):
         t_loss = train_one_epoch(model, train_loader, criterion, optimizer, device)
-        v_loss, v_acc = validate(model, test_loader, criterion, device) # A MODIFIER -> vmIoU
+        v_loss, v_mIoU = validate(model, test_loader, criterion, device, mIoU_metric) # A MODIFIER -> vmIoU
 
         train_losses.append(t_loss)
         val_losses.append(v_loss)
 
         print(
-            f"Epoch {epoch+1}/{args.epochs} | Train Loss: {t_loss:.4f} | Val Loss: {v_loss:.4f} | Val Acc: {v_acc:.2f}%" # A MODIFIER -> Val mIoU
+            f"Epoch {epoch+1}/{args.epochs} | Train Loss: {t_loss:.4f} | Val Loss: {v_loss:.4f} | Val mIoU: {v_mIoU:.2f}%" 
+            
         )
 
         # Save Checkpoint
         checkpoint_path = os.path.join(
-            args.checkpoint_dir, f"dino_classifier_latest.pth" # A MODIFIER -> DinoSegmenter
+            args.checkpoint_dir, f"dino_segmenter_latest.pth" # A MODIFIER -> DinoSegmenter
         )
         torch.save(
             {
                 "epoch": epoch + 1,
                 "model_state_dict": model.state_dict(),
-                "val_acc": v_acc, # A MODIFIER -> mIoU
+                "val_mIoU": v_mIoU, 
             },
             checkpoint_path,
         )
@@ -213,8 +212,11 @@ def main(args):
 
 
 if __name__ == "__main__":
+
+    # os.environ ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
+
     parser = argparse.ArgumentParser(
-        description="AttentionSurgeon: DINOv2 Linear Probing for Classification [cite: 31]" # A MODIFIER -> Segmentation
+        description="AttentionSurgeon: DINOv2 Linear Probing for Segmentation [cite: 31]" # A MODIFIER -> Segmentation
     )
 
     # Path Arguments
@@ -243,7 +245,11 @@ if __name__ == "__main__":
     parser.add_argument(
         "--device", type=str, default=None, help="Force device (e.g., cuda, mps, cpu)"
     )
-    parser.add_argument("--num_workers", type=int, default=2, help="DataLoader workers") # A MODIFIER -> Workers ?
+    parser.add_argument("--num_workers", type=int, default=2, help="DataLoader workers") 
 
     args = parser.parse_args()
     main(args)
+
+
+# command to run the script:
+# python3 ./Final_Project/DTU_ADLCV_attention_surgeon_grp10/DPT_segmentation/segmentation.py --data_dir ./Final_Project/DTU_ADLCV_attention_surgeon_grp10/DPT_segmentation/data --checkpoint_dir ./checkpoints --epochs 1 --batch_size 3 --lr 1e-4 --device cpu --num_workers 1

@@ -1,8 +1,8 @@
 import torch
 import torch.nn as nn
 
-from .vit import (
-    _make_pretrained_vitb16_384,
+from vit import (
+    _make_pretrained_vitb14_224,
     forward_vit,
 )
 
@@ -19,8 +19,8 @@ def _make_encoder(
     enable_attention_hooks=False,
 ):
     
-    if backbone == "vitb16_384":
-        pretrained = _make_pretrained_vitb16_384(
+    if backbone == "vitb14_224":
+        pretrained = _make_pretrained_vitb14_224(
             use_pretrained,
             hooks=hooks,
             use_readout=use_readout,
