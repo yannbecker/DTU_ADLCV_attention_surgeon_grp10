@@ -34,15 +34,27 @@ class PruningEnv:
         self.num_heads = 144
         self.base_flops = self.num_heads  # Simplified proxy for FLOPs
 
-        self.proxy_loader = get_proxy_loader(dataloader, num_samples=500)
-        self.validator = FastProxyValidator(
-            model, self.proxy_loader, nn.CrossEntropyLoss(), device
-        )
+        # We store the full dataloader so we can resample from it
+        self.full_dataloader = dataloader
 
+        # 1. Initialize the proxy validator
+        self.resample_proxy()
+
+        # 2. Initialize the Micro-Census for fast spatial metrics
         self.micro_census_loader = get_proxy_loader(dataloader, num_samples=16, seed=99)
         self.census = HeadCensus(model, device)
 
         self.reset()
+
+    def resample_proxy(self):
+        """Dynamic Proxy Resampling. Draws a new 500-image subset."""
+        # Passing seed=None forces numpy to pull a completely random subset every time
+        self.proxy_loader = get_proxy_loader(
+            self.full_dataloader, num_samples=500, seed=None
+        )
+        self.validator = FastProxyValidator(
+            self.model, self.proxy_loader, nn.CrossEntropyLoss(), self.device
+        )
 
     def reset(self):
         self.mask = torch.ones(self.num_heads).to(self.device)
@@ -71,7 +83,7 @@ class PruningEnv:
         return valid_mask
 
     def _get_state(self):
-        # Re-run the census on just 16 images - zero out old metrics and fill in new ones
+        # 1. Update Spatial Metrics
         self.census.head_metrics.zero_()
         for i in range(12):
             self.census.head_metrics[3, i, :] = (i + 1) / 12.0
@@ -85,7 +97,11 @@ class PruningEnv:
 
         # 2. Get Scalars
         flops_ratio = get_flops_ratio(self.mask)
-        scalars = torch.tensor([self.current_acc / 100.0, flops_ratio]).to(self.device)
+        # Time-Aware Critic (Progress scalar)
+        progress = self.steps / self.max_pruning
+        scalars = torch.tensor([self.current_acc / 100.0, flops_ratio, progress]).to(
+            self.device
+        )
 
         # 3. Get the Safeguard Mask
         safe_action_mask = self._get_valid_action_mask()
@@ -109,15 +125,25 @@ class PruningEnv:
 
         # # Calculate Reward: accuracy * (1 - (current FLOPs / base FLOPs))
         flops_ratio = get_flops_ratio(self.mask)
-        # reward = (new_acc / 100.0) * (1.0 - flops_ratio)
 
-        # Simple Delta-Accuracy Reward (FLOPS drop is constant per action, don't work if idle actions are possible)
-        reward = new_acc - self.current_acc
-        # Optional: Add a tiny survival bonus so the agent slightly prefers state stability
-        reward += 0.05
+        # Reward design: favorises "plateauing" and penalizes accuracy drops exponentially
+        delta = new_acc - self.current_acc
+
+        # 1. Exponential Penalty for dropping accuracy
+        if delta < 0:
+            step_reward = -(abs(delta) ** 1.5)
+        else:
+            # Sometimes pruning a noisy head actually increases accuracy slightly
+            step_reward = delta
+
+        # 2. Time-Scaled Survival Bonus
+        progress = self.steps / self.max_pruning
+        survival_bonus = 0.2 * progress  # Scales from 0.0 to +0.2 per step
+
+        reward = step_reward + survival_bonus
 
         print(
-            f"   -> Step {self.steps}: Pruned Head {action_idx} | New Acc: {new_acc:.2f}% | FLOPs Ratio: {flops_ratio:.4f} | Reward: {reward:.4f}"
+            f"   -> Step {self.steps}: Pruned Head {action_idx} | New Acc: {new_acc:.2f}% | Reward: {reward:.4f}"
         )
 
         self.current_acc = new_acc
@@ -225,8 +251,8 @@ class AdvancedActorCritic(nn.Module):
         self.vit = MiniViT(n_metrics=n_metrics, embed_dim=vit_embed_dim)
 
         # 2. Fusion Layer (ViT CLS token + Accuracy + FLOPs)
-        # Dimension: vit_embed_dim + 2 scalars
-        fused_dim = vit_embed_dim + 2
+        # Dimension: vit_embed_dim + 2 scalars + 1 progress scalar
+        fused_dim = vit_embed_dim + 3
 
         # Shared MLP for higher-level reasoning after fusion
         self.shared_mlp = nn.Sequential(
@@ -336,7 +362,7 @@ def train_ppo(args):
         )
 
     # Initialize Model and Data Loaders
-    _, val_loader, num_classes = get_loaders(
+    train_loader, val_loader, num_classes = get_loaders(
         dataset_name, args.data_dir, args.batch_size, num_workers=2
     )
     model = DinoClassifier(device=device, num_classes=num_classes).to(device)
@@ -346,11 +372,11 @@ def train_ppo(args):
             torch.load(args.checkpoint, map_location=device)["model_state_dict"]
         )
 
-    env = PruningEnv(model, val_loader, device, max_pruning=args.max_pruning)
+    env = PruningEnv(model, train_loader, device, max_pruning=args.max_pruning)
     policy = AdvancedActorCritic(n_metrics=7).to(device)
     optimizer = optim.Adam(policy.parameters(), lr=args.lr)
     eps_clip = 0.2
-    gamma = 0.99
+    # gamma = 0.99
 
     # Create save directory
     os.makedirs(args.save_dir, exist_ok=True)
@@ -362,7 +388,10 @@ def train_ppo(args):
     print("Starting PPO Training Loop...")
     for episode in range(args.episodes):
         print(f"\n--- Episode {episode+1}/{args.episodes} ---")
+        # Draw a completely new 500-image subset from the training set
+        env.resample_proxy()
         state_dict = env.reset()
+
         grids, scalars, masks, actions, log_probs, rewards, values = (
             [],
             [],
@@ -400,17 +429,25 @@ def train_ppo(args):
         total_return = sum(rewards)
         history["episodic_return"].append(total_return)
 
-        # 2. Compute Returns and Advantages
-        returns = []
-        discounted_reward = 0
-        for r in reversed(rewards):
-            discounted_reward = r + (gamma * discounted_reward)
-            returns.insert(0, discounted_reward)
+        # Generalized Advantage Estimation (GAE)
+        gamma = 0.99
+        gae_lambda = 0.95
+        advantages = []
+        gae = 0
 
-        returns = torch.tensor(returns, dtype=torch.float32).to(device)
-        values = torch.cat(values).squeeze()
-        advantages = returns - values.detach()
-        # Normalize advantages for stability
+        values_np = torch.cat(values).squeeze().detach().cpu().numpy()
+        values_np = np.append(values_np, 0.0)  # terminal state value
+
+        for t in reversed(range(len(rewards))):
+            delta = rewards[t] + gamma * values_np[t + 1] - values_np[t]
+            gae = delta + gamma * gae_lambda * gae
+            advantages.insert(0, gae)
+
+        advantages = torch.tensor(advantages, dtype=torch.float32).to(device)
+        values_tensor = torch.cat(values).squeeze().detach()
+        returns = advantages + values_tensor
+
+        # Normalize advantages
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
         # 3. PPO Update Step
@@ -512,8 +549,8 @@ if __name__ == "__main__":
         default="./checkpoints_rl",
         help="Where to save RL agent weights",
     )
-    parser.add_argument("--episodes", type=int, default=100)
-    parser.add_argument("--max_pruning", type=int, default=72)
+    parser.add_argument("--episodes", type=int, default=200)
+    parser.add_argument("--max_pruning", type=int, default=50)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--device", type=str, default=None)
