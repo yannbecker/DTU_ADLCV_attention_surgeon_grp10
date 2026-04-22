@@ -52,6 +52,47 @@ def evaluate_agent(agent_path, max_prune, model, test_loader, criterion, device)
     return full_acc
 
 
+def evaluate_agent_trajectory(
+    agent_path, x_vals, model, test_loader, criterion, device
+):
+    """
+    Loads ONE master agent and evaluates its performance progressively
+    at specific step intervals (x_vals) during a single surgical rollout.
+    """
+    agent = AdvancedActorCritic(n_metrics=7).to(device)
+    agent.load_state_dict(torch.load(agent_path, map_location=device))
+    agent.eval()
+
+    max_steps = max(x_vals)
+    env = PruningEnv(model, test_loader, device, max_pruning=max_steps)
+    state = env.reset()
+
+    trajectory_results = []
+
+    print(f"Unrolling single agent trajectory up to {max_steps} steps...")
+    with torch.no_grad():
+        for step in range(1, max_steps + 1):
+            # Agent picks the next head to prune
+            dist, _ = agent(state["metric_grid"], state["scalars"], state["mask"])
+            action = dist.probs.argmax()
+            state, _, done = env.step(action.item())
+
+            # If the current step is one of our target x_vals, evaluate the full test set
+            if step in x_vals:
+                print(
+                    f"  [Pause Surgery] Evaluating full test set at {step} pruned heads..."
+                )
+                model.set_mask(env.mask)
+                _, full_acc = evaluate(model, test_loader, criterion, device)
+                trajectory_results.append((step, full_acc))
+                print(f"  -> Full Test Acc: {full_acc:.2f}%")
+
+            if done:
+                break
+
+    return trajectory_results
+
+
 def main(args):
     device = torch.device(
         args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu")
@@ -126,6 +167,50 @@ def main(args):
 
             if agent_data:
                 results[f"Agent ({atype.capitalize()})"] = sorted(agent_data)
+
+    # ---------------------------------------------------------
+    # MODE: SINGLE CHECKPOINT (Single Master Agent Trajectory)
+    # ---------------------------------------------------------
+    elif args.mode == "single_checkpoint":
+        print(f"\n--- Loading Full Model for Checkpoint Trajectory Evaluation ---")
+        train_loader, test_loader, num_classes = get_loaders(
+            args.dataset, args.data_dir, args.batch_size, num_workers=2
+        )
+        model = DinoClassifier(device=device, num_classes=num_classes).to(device)
+
+        if os.path.exists(args.checkpoint):
+            model.load_state_dict(
+                torch.load(args.checkpoint, map_location=device)["model_state_dict"]
+            )
+        else:
+            raise FileNotFoundError(f"Base DINO weights not found at {args.checkpoint}")
+
+        criterion = nn.CrossEntropyLoss()
+
+        # Define the points you want to plot (e.g., matching the baseline)
+        target_x_vals = [i for i in range(0, 51, 2)]  # Evaluate every 2 heads up to 50
+        for v in target_x_vals:
+            all_x_vals.add(v)
+
+        for atype in args.agent_types:
+            # We specifically look for the master agent trained on the highest max_prune (e.g., 50)
+            master_agent_path = os.path.join(
+                args.agent_dir, f"surgeon_ppo_{atype}_50prune.pth"
+            )
+
+            if os.path.exists(master_agent_path):
+                print(f"\nEvaluating Master Agent ({atype})...")
+                agent_data = evaluate_agent_trajectory(
+                    master_agent_path,
+                    target_x_vals,
+                    model,
+                    test_loader,
+                    criterion,
+                    device,
+                )
+                results[f"Agent ({atype.capitalize()})"] = sorted(agent_data)
+            else:
+                print(f"[!] Master agent {master_agent_path} not found.")
 
     # ---------------------------------------------------------
     # BASELINE (Magnitude Sweep)
