@@ -129,6 +129,60 @@ class PhysicalPruner:
         # Bind the new method directly to this specific attention instance
         attn_module.forward = types.MethodType(new_forward, attn_module)
 
+    @staticmethod
+    def generate_sequence_tensor(agent, env, max_prune):
+        """
+        Runs the agent to generate a 1D tensor embedding the pruning order.
+        Value 0 = Kept.
+        Value K = Pruned at step K.
+        """
+        sequence_tensor = torch.zeros(144, dtype=torch.int32)
+        state = env.reset()
+
+        with torch.no_grad():
+            for step in range(1, max_prune + 1):
+                dist, _ = agent(state["metric_grid"], state["scalars"], state["mask"])
+                action = dist.probs.argmax().item()
+
+                sequence_tensor[action] = step
+                state, _, done = env.step(action)
+                if done:
+                    break
+
+        return sequence_tensor
+
+    @staticmethod
+    def get_mask_for_step(sequence_tensor, step):
+        """
+        Decodes the sequence tensor into a 12x12 binary mask for a specific step.
+        Heads pruned at <= 'step' are 0 (pruned).
+        All other heads are 1 (kept).
+        """
+        mask_1d = (sequence_tensor == 0) | (sequence_tensor > step)
+        return mask_1d.float().view(12, 12)
+
+    @staticmethod
+    def yield_sequential_models(base_model, sequence_tensor):
+        """
+        Generator designed for the environmental study script.
+        Yields: (step_number, physically_pruned_model)
+        """
+        import copy
+
+        max_step = sequence_tensor.max().item()
+
+        for step in range(1, max_step + 1):
+            # Create a fresh copy of the unpruned base model to avoid index shifting!
+            model_copy = copy.deepcopy(base_model)
+
+            # Decode the binary mask for this exact step
+            mask_12x12 = PhysicalPruner.get_mask_for_step(sequence_tensor, step)
+
+            # Physically prune the fresh copy
+            PhysicalPruner.prune_model(model_copy, mask_12x12)
+
+            yield step, model_copy
+
 
 def count_parameters(model):
     return sum(
