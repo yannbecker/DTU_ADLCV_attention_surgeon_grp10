@@ -195,7 +195,7 @@ class DinoDetector(DinoClassifier):
         raw  = self.det_head(feat)                     # (B, 255, 16, 16)
         B, _, H, W = raw.shape
         # Reshape to (B, anchors, H, W, 85)
-        return raw.view(B, NUM_ANCHORS, H, W, 5 + NUM_CLASSES)
+        return raw.reshape(B, NUM_ANCHORS, H, W, 5 + NUM_CLASSES)
 
     # ── Taylor importance — overrides DinoClassifier ──────────────────────────
 
@@ -263,7 +263,7 @@ def yolo_loss(
     lambda_cls: float   = 1.0,
 ) -> torch.Tensor:
     """
-    YOLOv3-style loss over a batch.
+    Inspired by YOLOv3 loss over a batch.
 
     Args:
         predictions : (B, 3, 16, 16, 85) — raw network output
@@ -751,8 +751,7 @@ class DetectionValidator:
                     B, FEAT_DIM, GRID_SIZE, GRID_SIZE
                 )
                 raw   = self.model.det_head(feat_map)
-                preds = raw.view(B, NUM_ANCHORS, GRID_SIZE, GRID_SIZE,
-                                 5 + NUM_CLASSES)
+                preds = raw.reshape(B, NUM_ANCHORS, GRID_SIZE, GRID_SIZE, 5 + NUM_CLASSES)
 
                 loss = yolo_loss(preds, targets, self.model.anchors, self.device)
                 running_loss     += loss.item()
@@ -881,7 +880,7 @@ if __name__ == "__main__":
     # Paths
     parser.add_argument("--datadir",        type=str,
                         default=os.path.join(os.environ.get("BLACKHOLE", "."), "COCO"),
-                        help="Path to COCO root (contains train2017/, val2017/, annotations/)")
+                        help="Path to COCO root (contains train2017/, val2017/, annotations/)") # export BLACKHOLE=/dtu/blackhole/10/224464
     parser.add_argument("--checkpoint_dir", type=str, default="checkpoints/",
                         help="Directory to save model checkpoints")
     parser.add_argument("--checkpoint",     type=str, default=None,
