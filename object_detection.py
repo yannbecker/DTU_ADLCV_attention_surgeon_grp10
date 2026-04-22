@@ -673,6 +673,7 @@ def evaluate(
     model:  DinoDetector,
     loader: DataLoader,
     device: torch.device,
+    datadir:  str | None = None,
 ) -> tuple[float, float, float]:
     """
     Full evaluation with official COCOeval mAP.
@@ -693,10 +694,15 @@ def evaluate(
     if coco_gt is None:
         # CachedFeaturesDataset: rebuild COCO object from annotation file
         # (needed for COCOeval — annotations are not stored in .pt files)
-        ann_file = os.path.join(
-            os.path.dirname(loader.dataset.split_dir),
-            "..", "annotations", "instances_val2017.json"
-        )
+        if datadir:
+            # Explicit path — guaranteed correct regardless of feat_dir layout
+            ann_file = os.path.join(datadir, "annotations", "instances_val2017.json")
+        else:
+            # Fallback: walk up from feat_dir/val/ → feat_dir/ → blackhole/COCO/
+            ann_file = os.path.join(
+                os.path.dirname(loader.dataset.split_dir),
+                "..", "..", "COCO", "annotations", "instances_val2017.json"
+            )
         ann_file = os.path.normpath(ann_file)
         if os.path.exists(ann_file):
             coco_gt = COCO(ann_file)
@@ -934,7 +940,8 @@ def main(args: argparse.Namespace) -> None:
 
     for epoch in range(args.epochs):
         t_loss              = train_one_epoch(model, train_loader, optimizer, device)
-        v_loss, map50, map50_95 = evaluate(model, val_loader, device)
+        v_loss, map50, map50_95 = evaluate(model, val_loader, device,
+                                   datadir=args.datadir)
         scheduler.step()
 
         train_losses.append(t_loss)
