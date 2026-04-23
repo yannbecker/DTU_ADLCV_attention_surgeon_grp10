@@ -119,13 +119,16 @@ class DinoDetector(DinoClassifier):
         del self.classifier
 
         out_ch = NUM_ANCHORS * (5 + NUM_CLASSES)   # 255
+    
         self.det_head = nn.Sequential(
             nn.Conv2d(FEAT_DIM, 512, kernel_size=3, padding=1),
             nn.BatchNorm2d(512),
             nn.LeakyReLU(0.1, inplace=True),
+            nn.Dropout2d(p=0.1),                  # dropout
             nn.Conv2d(512, 256, kernel_size=3, padding=1),
             nn.BatchNorm2d(256),
             nn.LeakyReLU(0.1, inplace=True),
+            nn.Dropout2d(p=0.1),                  # dropout again
             nn.Conv2d(256, out_ch, kernel_size=1),
         )
 
@@ -239,24 +242,16 @@ class DinoDetector(DinoClassifier):
 # =============================================================================
 
 def yolo_loss(
-    predictions: torch.Tensor,
-    targets: list[dict],
-    anchors: torch.Tensor,
-    device: torch.device,
+    predictions:  torch.Tensor,
+    targets:      list[dict],
+    anchors:      torch.Tensor,
+    device:       torch.device,
     lambda_coord: float = 5.0,
-    lambda_cls: float   = 1.0,
+    lambda_cls:   float = 1.0,
+    lambda_noobj: float = 0.5,    # ← YOLOv3 paper §2.2
+    ignore_thresh: float = 0.5,   # ← YOLOv3 paper §2.2
 ) -> torch.Tensor:
-    """
-    YOLOv3-style loss over a batch.
 
-    Args:
-        predictions : (B, 3, 16, 16, 85)
-        targets     : list of dicts with 'boxes' (N,4) xyxy norm, 'labels' (N,)
-        anchors     : (3, 2)
-        device      : torch device
-
-    Returns: scalar loss
-    """
     B, A, H, W, _ = predictions.shape
     C = NUM_CLASSES
 
@@ -276,7 +271,6 @@ def yolo_loss(
         cy = (boxes[:, 1] + boxes[:, 3]) / 2
         bw =  boxes[:, 2] - boxes[:, 0]
         bh =  boxes[:, 3] - boxes[:, 1]
-
         gi = (cx * W).long().clamp(0, W - 1)
         gj = (cy * H).long().clamp(0, H - 1)
 
@@ -287,47 +281,54 @@ def yolo_loss(
         best_anchor = (inter / union.clamp(min=1e-6)).argmax(dim=1)
 
         for n in range(len(boxes)):
-            a   = best_anchor[n].item()
-            gi_ = gi[n].item()
-            gj_ = gj[n].item()
-
+            a, gi_, gj_ = best_anchor[n].item(), gi[n].item(), gj[n].item()
             tgt_obj [b_idx, a, gj_, gi_]    = 1.0
             obj_mask[b_idx, a, gj_, gi_]    = True
             tgt_xy  [b_idx, a, gj_, gi_]    = torch.stack([
                 cx[n] * W - gi[n].float(),
-                cy[n] * H - gj[n].float(),
-            ])
+                cy[n] * H - gj[n].float()])
             tgt_wh  [b_idx, a, gj_, gi_]    = torch.stack([
                 torch.log(bw[n] / anchors[a, 0].clamp(min=1e-6)),
-                torch.log(bh[n] / anchors[a, 1].clamp(min=1e-6)),
-            ])
+                torch.log(bh[n] / anchors[a, 1].clamp(min=1e-6))])
             cls_idx = labels[n].item()
             if 0 <= cls_idx < C:
                 tgt_cls[b_idx, a, gj_, gi_, cls_idx] = 1.0
 
-    bce        = nn.BCELoss()
-    mse        = nn.MSELoss()
+    mse        = nn.MSELoss(reduction="sum")
+    bce_elem   = nn.BCELoss(reduction="none")
     bce_logits = nn.BCEWithLogitsLoss()
 
-    pred_obj = torch.sigmoid(predictions[..., 4])
-    loss_obj = bce(pred_obj, tgt_obj)
+    # ── Objectness: split positive / negative with ignore threshold ──────────
+    pred_obj    = torch.sigmoid(predictions[..., 4])
+    obj_loss_map = bce_elem(pred_obj, tgt_obj)          # (B, A, H, W)
 
+    # Ignore background cells with high predicted confidence (YOLOv3 §2.2)
+    with torch.no_grad():
+        ignore_mask = (~obj_mask) & (pred_obj > ignore_thresh)
+
+    loss_obj   = obj_loss_map[obj_mask].mean() if obj_mask.any() else torch.tensor(0., device=device)
+    noobj_mask = ~obj_mask & ~ignore_mask
+    loss_noobj = obj_loss_map[noobj_mask].mean() if noobj_mask.any() else torch.tensor(0., device=device)
+
+    # ── Box regression + classification over positive cells only ────────────
     if obj_mask.any():
         pred_xy = torch.stack([
             torch.sigmoid(predictions[..., 0]),
             torch.sigmoid(predictions[..., 1]),
         ], dim=-1)
-        pred_wh = predictions[..., 2:4]
-        loss_xy = mse(pred_xy[obj_mask], tgt_xy[obj_mask])
-        loss_wh = mse(pred_wh[obj_mask], tgt_wh[obj_mask])
+        pred_wh  = predictions[..., 2:4]
+        loss_xy  = mse(pred_xy[obj_mask], tgt_xy[obj_mask]) / B
+        loss_wh  = mse(pred_wh[obj_mask], tgt_wh[obj_mask]) / B
         loss_cls = bce_logits(predictions[..., 5:][obj_mask], tgt_cls[obj_mask])
     else:
-        loss_xy  = torch.tensor(0.0, device=device)
-        loss_wh  = torch.tensor(0.0, device=device)
-        loss_cls = torch.tensor(0.0, device=device)
+        loss_xy  = torch.tensor(0., device=device)
+        loss_wh  = torch.tensor(0., device=device)
+        loss_cls = torch.tensor(0., device=device)
 
-    return lambda_coord * (loss_obj + loss_xy + loss_wh) + lambda_cls * loss_cls
-
+    return (lambda_coord * (loss_xy + loss_wh)
+            + loss_obj
+            + lambda_noobj * loss_noobj
+            + lambda_cls * loss_cls)
 
 # =============================================================================
 # 4.  DECODE PREDICTIONS + NMS
