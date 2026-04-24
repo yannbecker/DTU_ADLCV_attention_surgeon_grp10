@@ -98,7 +98,7 @@ class Transpose(nn.Module):
     def forward(self, x):
         x = x.transpose(self.dim0, self.dim1)
         return x
-
+    
 
 def forward_vit(pretrained, x):
     b, c, h, w = x.shape
@@ -110,6 +110,11 @@ def forward_vit(pretrained, x):
     layer_3 = pretrained.activations["3"]
     layer_4 = pretrained.activations["4"]
 
+    return layer_1, layer_2, layer_3, layer_4
+
+
+def readout_concatenate(pretrained,layer_1, layer_2, layer_3, layer_4):
+    
     layer_1 = pretrained.act_postprocess1[0:2](layer_1)
     layer_2 = pretrained.act_postprocess2[0:2](layer_2)
     layer_3 = pretrained.act_postprocess3[0:2](layer_3)
@@ -120,8 +125,8 @@ def forward_vit(pretrained, x):
             2,
             torch.Size(
                 [
-                    h // pretrained.model.patch_size[1],
-                    w // pretrained.model.patch_size[0],
+                    224 // pretrained.model.patch_size[1], # Image size : 3x224x224
+                    224 // pretrained.model.patch_size[0],
                 ]
             ),
         )
@@ -146,6 +151,8 @@ def forward_vit(pretrained, x):
     #print(f"Shape after postprocessing layer_4: {layer_4.shape}")
 
     return layer_1, layer_2, layer_3, layer_4
+
+    
 
 
 def _resize_pos_embed(self, posemb, gs_h, gs_w):

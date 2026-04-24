@@ -9,6 +9,7 @@ from blocks import (
     Interpolate,
     _make_encoder,
     forward_vit,
+    readout_concatenate
 )
 
 
@@ -63,37 +64,38 @@ class DPT(BaseModel):
 
         self.scratch.output_conv = head
 
-    def forward(self, x):
+    def forward(self, x, features = True):
         if self.channels_last == True:
             x.contiguous(memory_format=torch.channels_last)
 
-        #print(f"Entering forward_vit. Input shape: {x.shape}")
-        layer_1, layer_2, layer_3, layer_4 = forward_vit(self.pretrained, x)
+        if features :
+            layer_1, layer_2, layer_3, layer_4 = x # output layers of vit directly
+        else :
+            layer_1, layer_2, layer_3, layer_4 = forward_vit(self.pretrained, x) # Go through ViT 
+        layer_1, layer_2, layer_3, layer_4 = readout_concatenate(self.pretrained, layer_1, layer_2, layer_3, layer_4 ) # Readout and concatenate operations
         # layer_1 : Bx96x64x64 -> Bx96x56x56,
         # layer_2 : Bx192x32x32 -> Bx192x28x28,
         # layer_3 : Bx384x16x16 -> Bx384x14x14,
         # layer_4 : Bx768x8x8 -> Bx768x7x7
 
-        #print(f"Output shapes from forward_vit: layer_1: {layer_1.shape}, layer_2: {layer_2.shape}, layer_3: {layer_3.shape}, layer_4: {layer_4.shape}. \n Entering the first scratch layer.")
-        layer_1_rn = self.scratch.layer1_rn(layer_1) # layer_1_rn : Bx96x64x64
+        # Resample operations
+        layer_1_rn = self.scratch.layer1_rn(layer_1) # layer_1_rn : Bx96x64x64   
         layer_2_rn = self.scratch.layer2_rn(layer_2) # layer_2_rn : Bx192x32x32
         layer_3_rn = self.scratch.layer3_rn(layer_3) # layer_3_rn : Bx384x16x16
         layer_4_rn = self.scratch.layer4_rn(layer_4) # layer_4_rn : Bx768x8x8
 
-        #print(f"Output shapes from scratch layers: layer_1_rn: {layer_1_rn.shape}, layer_2_rn: {layer_2_rn.shape}, layer_3_rn: {layer_3_rn.shape}, layer_4_rn: {layer_4_rn.shape}. \n Entering the refinement layers.")
+        # Fusion operations
         path_4 = self.scratch.refinenet4(layer_4_rn)          # path_4 : Bx256x16x16
         path_3 = self.scratch.refinenet3(path_4, layer_3_rn)  # path_3 : Bx256x32x32
         path_2 = self.scratch.refinenet2(path_3, layer_2_rn)  # path_2 : Bx256x64x64
-        path_1 = self.scratch.refinenet1(path_2, layer_1_rn)  # path_1 : Bx256x128x128
+        path_1 = self.scratch.refinenet1(path_2, layer_1_rn)  # path_1 : Bx256x128x128 
 
-        #print(f"Output shapes from refinement layers: path_4: {path_4.shape}, path_3: {path_3.shape}, path_2: {path_2.shape}, path_1: {path_1.shape}. \n Entering the output convolution.")
+        # Final convolution 
         out = self.scratch.output_conv(path_1)
-        #return out
-
-        #print(f"Output shape from output convolution: {out.shape}. \n Returning the output.")
+        
+        
         return path_2, out # We return path_2 instead to be able to use the auxiliary head. 
-                            #ATTENTION PATH2 DOIT ETRE COMPATIBLE AVEC AUXILIARY HEAD
-                            #ATTENTION ON PASSE D'UNE SORTIE A DEUX SORTIES
+                            
         
 
 
@@ -108,14 +110,14 @@ class DPTSegmentationModel(DPT):
         kwargs["use_bn"] = True
 
         head = nn.Sequential(
-            #nn.Conv2d(features, features, kernel_size=3, padding=1, bias=False),
+    
             nn.Conv2d(features, features, kernel_size=3, padding=1, bias=False), 
             nn.BatchNorm2d(features),
             nn.ReLU(True),
             nn.Dropout(0.1, False),
             nn.Conv2d(features, num_classes, kernel_size=1),
-            # Interpolate(scale_factor=2, mode="bilinear", align_corners=True),
-            nn.Upsample(size=(224, 224)) # A MODIFIER / VERIFIER -> We upsample to the original image size (224x224) to be able to compute the loss with the original masks. 
+            Interpolate(scale_factor=2, mode="bilinear", align_corners=True),
+            # nn.Upsample(size=(224, 224)) # A MODIFIER / VERIFIER -> We upsample to the original image size (224x224) to be able to compute the loss with the original masks. 
         )
 
         super().__init__(head, **kwargs) # Replaces the classic DPT head with a segmentation head
@@ -126,6 +128,7 @@ class DPTSegmentationModel(DPT):
             nn.ReLU(True),
             nn.Dropout(0.1, False),
             nn.Conv2d(features, num_classes, kernel_size=1),
+            Interpolate(scale_factor=4, mode="bilinear", align_corners=True)
         )
 
         if path is not None:

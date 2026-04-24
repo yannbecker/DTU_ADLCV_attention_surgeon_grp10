@@ -4,6 +4,7 @@ import torch.nn as nn
 from vit import (
     _make_pretrained_vitb14_224,
     forward_vit,
+    readout_concatenate
 )
 
 def _make_encoder(

@@ -6,40 +6,23 @@ from torchvision import transforms
 import torchvision.transforms.functional as TF
 import matplotlib.pyplot as plt
 import numpy as np
+from tqdm import tqdm
+from vit import forward_vit
 
 
-def colormap_to_class_indices(mask, colormap):
-    """
-    Convert a color-coded segmentation mask to class indices.
-    
-    Args:
-        mask (PIL Image or np.array): The input segmentation mask with RGB colors.
-        colormap (np.array): An array of shape (num_classes, 3) where each row is an RGB color corresponding to a class index.
-    
-    Returns:
-        np.array: A 2D array of shape (H, W) with class indices.
-    """
-    if isinstance(mask, Image.Image):
-        mask = np.array(mask)
-    
-    # Initialize an array for class indices
-    class_indices = np.zeros(mask.shape[0:2], dtype=np.int64)
-    
-    # For each color in the colormap, create a boolean mask and assign the corresponding class index
-    for idx, color in enumerate(colormap):
-        matches = np.all(mask == color, axis=-1)
-        class_indices[matches] = idx
-    
-    return class_indices
 
-class ADE20KMinimalDataset(Dataset):
-    def __init__(self, img_dir, mask_dir, size=(224, 224)):
+class ADE20KDataset(Dataset):
+    def __init__(self, img_dir, mask_dir, return_name = True, size=(224, 224)):
         self.img_dir = img_dir
         self.mask_dir = mask_dir
         self.size = size
         # On trie pour que img1.jpg corresponde bien à img1.png
         self.img_names = sorted(os.listdir(img_dir))
         self.mask_names = sorted(os.listdir(mask_dir))
+        self.return_name = True
+
+    def set_return_name(self, b : bool):
+        self.return_name = b
 
     def __len__(self):
         return len(self.img_names)
@@ -53,7 +36,7 @@ class ADE20KMinimalDataset(Dataset):
         # ADE20K utilise des masques .png où chaque pixel est l'ID de la classe
         #mask = Image.open(mask_path)
         
-        mask = Image.open(mask_path) # Mode L
+        mask = Image.open(mask_path).convert("L") # Mode L
 
         # 2. Transformations communes (Redimensionnement)
         # Note : Pour un ViT, 'size' doit souvent être (224, 224) ou (384, 384)
@@ -70,80 +53,131 @@ class ADE20KMinimalDataset(Dataset):
         #mask = colormap_to_class_indices(mask, ade20k_palette)
         mask = torch.from_numpy(np.array(mask)).long()
         mask = mask - 1 # classes from 0 to 149
+        
+        if self.return_name:
+            return image, mask, self.img_names[idx] 
+        else :
+            return image, mask
+    
+def ADE20K_through_ViT(model, dataloader, device, data_dir, process_type):
+    " Get feature images from the original ADE20K dataset through ViT and preprocess masks to the right format "
+    os.makedirs(data_dir, exist_ok=True)
+    os.makedirs(os.path.join(data_dir,"feature_images"), exist_ok=True)
+    os.makedirs(os.path.join(data_dir,"preprocessed_masks"), exist_ok=True)
+    os.makedirs(os.path.join(data_dir,"feature_images",process_type), exist_ok=True)
+    os.makedirs(os.path.join(data_dir,"preprocessed_masks",process_type), exist_ok=True)
+    model.eval()
+    
+    with torch.no_grad():
+        for i, (images, mask, img_names) in enumerate(tqdm(dataloader)):
+            # images: (B, 3, 224, 224)
+            images = images.to(device)
+            l1, l2, l3, l4 = forward_vit(model.pretrained,images)
+            
+            # iteration on batch
+            for j in range(images.size(0)):
+                feature_dict = {
+                    "layer_1": l1[j].detach().cpu(),
+                    "layer_2": l2[j].detach().cpu(),
+                    "layer_3": l3[j].detach().cpu(),
+                    "layer_4": l4[j].detach().cpu()
+                }
+                # We use the original name to name the file .pth
+                save_path_img = os.path.join(data_dir, "feature_images",process_type,f"{img_names[j][:-4]}.pth")
+                torch.save(feature_dict, save_path_img)
+            
+                save_path_mask = os.path.join(data_dir, "preprocessed_masks", process_type ,f"{img_names[j][:-4]}.pth")
+                
+                torch.save(mask[j], save_path_mask)
+            
 
-        return image, mask
+    # create new data : data/train/feature_images, data/validation/feature_images
+    # Load train_dataset, val_dataset ADE20K
+    # Put train_dataset through vit -> forward_vit(images) for images in dataset
+    # Save Layer1 - Layer4 for every image
+    # Same for validation
 
-ade20k_palette = np.array([
-    [120, 120, 120], [180, 120, 120], [6, 230, 230], [80, 50, 50],
-    [4, 200, 3], [120, 120, 80], [140, 140, 140], [204, 5, 255],
-    [230, 230, 230], [4, 250, 7], [224, 5, 255], [235, 255, 7],
-    [150, 5, 61], [120, 120, 70], [8, 255, 51], [255, 6, 82],
-    [143, 255, 140], [204, 255, 4], [255, 51, 7], [204, 70, 3],
-    [0, 102, 200], [61, 230, 250], [255, 6, 51], [11, 102, 255],
-    [255, 7, 71], [255, 9, 224], [9, 7, 230], [220, 220, 220],
-    [255, 9, 92], [112, 9, 255], [8, 255, 214], [7, 255, 224],
-    [255, 184, 6], [10, 255, 71], [255, 41, 10], [7, 255, 255],
-    [224, 255, 8], [102, 8, 255], [255, 61, 6], [255, 194, 7],
-    [255, 122, 8], [0, 255, 20], [255, 8, 41], [255, 5, 153],
-    [6, 51, 255], [235, 12, 255], [160, 150, 20], [0, 163, 255],
-    [140, 140, 140], [250, 10, 15], [20, 255, 0], [31, 255, 0],
-    [255, 31, 0], [255, 224, 0], [153, 255, 0], [0, 0, 255],
-    [255, 71, 0], [0, 235, 255], [0, 173, 255], [31, 0, 255],
-    [11, 200, 200], [255, 82, 0], [0, 255, 245], [0, 61, 255],
-    [0, 255, 112], [0, 255, 133], [255, 0, 0], [255, 163, 0],
-    [255, 102, 0], [194, 255, 0], [0, 143, 255], [51, 255, 0],
-    [0, 82, 255], [0, 255, 41], [0, 255, 173], [10, 0, 255],
-    [173, 255, 0], [0, 255, 153], [255, 92, 0], [255, 0, 255],
-    [255, 0, 245], [255, 0, 102], [255, 173, 0], [255, 0, 20],
-    [255, 184, 184], [0, 31, 255], [0, 255, 61], [0, 71, 255],
-    [255, 0, 204], [0, 255, 194], [0, 255, 82], [0, 10, 255],
-    [0, 112, 255], [51, 0, 255], [0, 194, 255], [0, 122, 255],
-    [0, 255, 163], [255, 153, 0], [0, 255, 10], [255, 112, 0],
-    [143, 255, 0], [82, 0, 255], [163, 255, 0], [255, 235, 0],
-    [8, 184, 170], [133, 0, 255], [0, 255, 92], [184, 0, 255],
-    [255, 0, 31], [0, 184, 255], [0, 214, 255], [255, 0, 112],
-    [92, 255, 0], [0, 224, 255], [112, 224, 255], [70, 184, 160],
-    [163, 0, 255], [153, 0, 255], [71, 255, 0], [255, 0, 163],
-    [255, 204, 0], [255, 0, 143], [0, 255, 235], [133, 255, 0],
-    [255, 0, 235], [245, 0, 255], [255, 0, 122], [255, 245, 0],
-    [10, 190, 212], [214, 255, 0], [0, 204, 255], [20, 0, 255],
-    [255, 255, 0], [0, 153, 255], [0, 41, 255], [0, 255, 204],
-    [41, 0, 255], [41, 255, 0], [173, 0, 255], [0, 245, 255],
-    [71, 0, 255], [122, 0, 255], [0, 255, 184], [0, 92, 255],
-    [184, 255, 0], [0, 133, 255], [255, 214, 0], [25, 194, 194],
-    [102, 255, 0], [92, 0, 255]
-])
 
-# --- Utilisation ---
+
+
+
+class ADE20KFeatureDataset(Dataset):
+    def __init__(self, feature_images_dir, preprocessed_masks_dir, size = (224,224), return_name = False):
+        self.feature_images_dir = feature_images_dir
+        self.preprocessed_masks_dir = preprocessed_masks_dir
+        self.filenames = [f.replace(".pth", "") for f in os.listdir(feature_images_dir)]
+        self.size = size
+        self.set_return_name = return_name
+
+    def set_return_name(self, b : bool):
+        self.return_name = b
+
+    def __getitem__(self, idx):
+        
+        name = self.filenames[idx]
+        # Load extracted features from vit
+        features = torch.load(os.path.join(self.feature_images_dir, f"{name}.pth"))
+        
+        # Load mask
+        mask = torch.load(os.path.join(self.preprocessed_masks_dir, f"{name}.pth"))
+
+        return (features["layer_1"], features["layer_2"], features["layer_3"], features["layer_4"]), mask
+
+    def __len__(self):
+        return len(self.filenames)
+
 
 if __name__ == "__main__":
-    mode = "test"
-    if mode == "test":
+
+
+    # A MODIFIER : ajouter argparse
+    device = "mps"
+    mode = "affichage"
+
+
+    if mode == "test_mask":
         current_dir = "Final_Project/DTU_ADLCV_attention_surgeon_grp10/DPT_segmentation"
         print(f"Current working directory: {current_dir}")
-        img_dir = os.path.join(current_dir, 'data/images')
+        img_dir = os.path.join(current_dir, 'data/feature_images')
         mask_dir = os.path.join(current_dir, 'data/annotations')
-        dataset = ADE20KMinimalDataset(img_dir=img_dir, mask_dir=mask_dir)
-        dataloader = DataLoader(dataset, batch_size=3, shuffle=True)
+        dataset = ADE20KFeatureDataset(feature_dir=img_dir, mask_dir=mask_dir)
+        #dataloader = DataLoader(dataset, batch_size=3, shuffle=True)
         image, mask = dataset.__getitem__(98)
-        print(mask.shape)  # Devrait être (H, W) avec des valeurs d'indices de classe
-        print(mask)  # Devrait montrer les indices de classe présents dans le masque
-        print(f"Unique class indices in the mask: {torch.unique(mask)}")  # Devrait montrer les indices de classe uniques présents dans le masque
+        print(f"Image features: {[f.shape for f in image]}")  # Show form of the features from vit
+
 
 
     if mode == "affichage":
         current_dir = "Final_Project/DTU_ADLCV_attention_surgeon_grp10/DPT_segmentation"
         img_dir = os.path.join(current_dir, 'data/images')
         mask_dir = os.path.join(current_dir, 'data/annotations')
-        dataset = ADE20KMinimalDataset(img_dir=img_dir, mask_dir=mask_dir)
+        dataset = ADE20KDataset(img_dir=img_dir, mask_dir=mask_dir)
+        dataloader = DataLoader(dataset, batch_size=12, shuffle=False)
         
     
         # Display size of images and masks in the first batch
-        images, masks = next(iter(dataloader))
+        images, masks, _ = next(iter(dataloader))
         
-        print(f"Batch of images shape: {images.shape}")  # Should be [B, 3, H, W]
-        print(f"Batch of masks shape: {masks.shape}")    # Should be [B, H, W]
-
+        #print(f"Batch of images shape: {images.shape}")  # Should be [B, 3, H, W]
+        #print(f"Batch of masks shape: {masks.shape}")    # Should be [B, H, W]
+        #print(masks[0])  # Print the first mask tensor to check values (should be class indices)
+        m0 = masks[0].unsqueeze(0)
+        m1 = masks[1].unsqueeze(0)
+        m2 =masks[2].unsqueeze(0)
+        masque = (m1 == -1)
+        m1[masque] = 1000
+        from torchmetrics.classification import MulticlassJaccardIndex
+        mIoU_metric = MulticlassJaccardIndex(num_classes=150, ignore_index=-1)
+        for i in range(10):
+            mIoU_metric.update(m1,m0)
+            mIoU_metric.update(m1,m0)
+            mIoU_metric.update(m1,m0)
+            mIoU_metric.update(m1,m0)
+            mIoU_metric.update(m1,m0)
+            mIoU_metric.update(m1,m2)
+        print(mIoU_metric.compute().item())
+        
+        
         # plotting a batch of images and masks
 
         def plot_batch(images, masks):
@@ -165,4 +199,4 @@ if __name__ == "__main__":
             plt.tight_layout()
             plt.show()
 
-        plot_batch(*next(iter(dataloader)))
+        #plot_batch(*next(iter(dataloader)))
