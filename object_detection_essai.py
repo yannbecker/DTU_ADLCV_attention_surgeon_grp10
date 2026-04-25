@@ -721,7 +721,10 @@ def evaluate(
             running_loss += loss.item()
 
             if coco_gt is not None:
-                detections = decode_predictions(preds, model.anchors)
+                # Low threshold for eval: COCOeval sweeps confidence internally
+                # to build the PR curve — it needs predictions at many score levels.
+                # 0.25 is for inference only.
+                detections = decode_predictions(preds, model.anchors, conf_thresh=0.01)
                 for det, tgt in zip(detections, targets):
                     img_id = tgt["image_id"]
                     # decode_predictions outputs boxes in IMG_SIZE (224px) space;
