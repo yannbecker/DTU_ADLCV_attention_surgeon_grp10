@@ -275,10 +275,10 @@ def _make_vit_b14_backbone(
         nn.Conv2d(
             in_channels=vit_features,
             out_channels=features[0],
-            kernel_size=3,  #1     # Test : kernel_size=3, padding=1 -> Bx96x14x14
+            kernel_size=1,  #1     # Test : kernel_size=3, padding=1 -> Bx96x14x14
             stride=1,
             padding=0,
-        ),  # Bx96x14x14
+        ),  # Bx96x16x16
         nn.ConvTranspose2d(
             in_channels=features[0],
             out_channels=features[0],
@@ -298,7 +298,7 @@ def _make_vit_b14_backbone(
         nn.Conv2d(
             in_channels=vit_features,
             out_channels=features[1],
-            kernel_size=3,  #1     # Test : kernel_size=3, padding=1 -> Bx192x14x14
+            kernel_size=1,  #1     # Test : kernel_size=3, padding=1 -> Bx192x14x14
             stride=1,
             padding=0,
         ),
@@ -321,7 +321,7 @@ def _make_vit_b14_backbone(
         nn.Conv2d(
             in_channels=vit_features,
             out_channels=features[2],
-            kernel_size=3,  #1     # Test : kernel_size=3, padding=1 -> Bx384x14x14
+            kernel_size=1,  #1     # Test : kernel_size=3, padding=1 -> Bx384x14x14
             stride=1,
             padding=0,
         ),
@@ -334,7 +334,7 @@ def _make_vit_b14_backbone(
         nn.Conv2d(
             in_channels=vit_features,
             out_channels=features[3],
-            kernel_size=3,  #1     # Test : kernel_size=3, padding=1 -> Bx768x14x14
+            kernel_size=1,  #1     # Test : kernel_size=3, padding=1 -> Bx768x14x14
             stride=1,
             padding=0,
         ),

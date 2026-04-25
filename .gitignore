@@ -6,6 +6,7 @@ checkpoints*/
 models/
 DPT_segmentation/models/
 *.pth
+test.py
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

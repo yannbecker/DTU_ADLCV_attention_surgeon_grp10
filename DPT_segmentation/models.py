@@ -116,8 +116,8 @@ class DPTSegmentationModel(DPT):
             nn.ReLU(True),
             nn.Dropout(0.1, False),
             nn.Conv2d(features, num_classes, kernel_size=1),
-            Interpolate(scale_factor=2, mode="bilinear", align_corners=True),
-            # nn.Upsample(size=(224, 224)) # A MODIFIER / VERIFIER -> We upsample to the original image size (224x224) to be able to compute the loss with the original masks. 
+            # Interpolate(scale_factor=2, mode="bilinear", align_corners=True),
+            nn.Upsample(size=(224, 224)) # A MODIFIER / VERIFIER -> We upsample to the original image size (224x224) to be able to compute the loss with the original masks. 
         )
 
         super().__init__(head, **kwargs) # Replaces the classic DPT head with a segmentation head
@@ -128,7 +128,8 @@ class DPTSegmentationModel(DPT):
             nn.ReLU(True),
             nn.Dropout(0.1, False),
             nn.Conv2d(features, num_classes, kernel_size=1),
-            Interpolate(scale_factor=4, mode="bilinear", align_corners=True)
+            # Interpolate(scale_factor=4, mode="bilinear", align_corners=True)
+            nn.Upsample(size=(224, 224)) 
         )
 
         if path is not None:

@@ -19,16 +19,14 @@ from dataloaders_segmentation import ADE20KDataset, ADE20K_through_ViT, ADE20KFe
 
 
 class DinoSegmenter(DPTSegmentationModel):
-
-    def __init__(self, device, **kwargs): # A MODIFIER / VERIFIER : argument num_classes ?
+    """ DinoSegmenter: DINOv2 backbone + DPT segmentation head """
+    def __init__(self, device, **kwargs): 
 
         super().__init__(**kwargs) 
 
         # Freeze the backbone for linear probing [cite: 40, 44]
         for param in self.pretrained.model.parameters():
             param.requires_grad = False
-
-        # Equivalent de self.classifier = nn.Linear(768, num_classes) ?
 
         # Internal state for the pruning mask (12 layers x 12 heads)
         self.mask = torch.ones(12, 12).to(device)
@@ -86,7 +84,8 @@ def train_one_epoch(model, loader, criterion, optimizer, device, alpha = 0.2, wi
             images, masks = [l.to(device) for l in images], masks.to(device)
         else :
             images, masks = images.to(device), masks.to(device)
-        path2, outputs = model(images, features = args.features) # model = DPTSegmenter
+        path2, outputs = model(images, features = args.features) # model = DPTSegmenter, 
+        # feature = True -> train directly from the output of the vit, feature = False -> train from RGB images that go through the vit
         
         aux_outputs = model.auxlayer(path2) 
         loss = criterion(outputs, masks) + (alpha*criterion(aux_outputs, masks) if with_loss_aux else 0) 
@@ -106,7 +105,7 @@ def validate(
         miou_metric,  
         alpha=0.1, 
         with_loss_aux=True,
-        features = True
+        features = True # feature = True -> train directly from the output of the vit, feature = False -> train from RGB images that go through the vit
              ):
     model.eval()
     running_loss = 0.0
@@ -123,13 +122,12 @@ def validate(
             outputs = torch.argmax(outputs, dim=1) 
             
             running_loss += loss.item()
-
             # Update of the mIoU metric
             # outputs: [B, H, W], masks: [B, H, W]
             miou_metric.update(outputs, masks)
 
     Final_mIoU = miou_metric.compute().item() 
-    miou_metric.reset()
+    miou_metric.reset() # Reset the metric for the next epoch
     return running_loss / len(loader), Final_mIoU
 
 
@@ -156,10 +154,7 @@ def get_loaders(data_dir, batch_size, num_workers, use_features = True):
     return train_loader, test_loader
 
 
-
-
-
-def main(args):
+def main(args): # Training loop function
 
     # -------------------- DEVICE SETUP
     if args.device:
@@ -184,13 +179,8 @@ def main(args):
     os.makedirs(args.checkpoint_dir, exist_ok=True)
 
     criterion = nn.CrossEntropyLoss(ignore_index=-1) 
-    # Remplacement de Adam par SGD avec Momentum
-    optimizer = optim.SGD(
-        model.parameters(), 
-        lr=args.lr, 
-        momentum=0.9, 
-        weight_decay=1e-4  # Valeur souvent utilisée dans DPT
-    )
+    # SGD + 0.9 momentum -> AdamW, lr = 1e-4
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-2)
 
     train_losses, val_losses, mIoUs = [], [], []
     mIoU_metric = MulticlassJaccardIndex(num_classes=150, ignore_index=-1).to(device) # A MODIFIER / VERIFIER -> Attention à l'indice des classes, 0 = background dans ADE20K
@@ -206,12 +196,10 @@ def main(args):
         print(f"Loading checkpoint: {args.resume_path}")
         checkpoint = torch.load(args.resume_path, map_location=device)
         
-        # Restaurer les états
         model.load_state_dict(checkpoint['model_state_dict'])
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         start_epoch = checkpoint['epoch']
         
-        # Restaurer l'historique si présent
         if 'train_losses' in checkpoint:
             train_losses = checkpoint['train_losses']
             val_losses = checkpoint['val_losses']
@@ -253,11 +241,10 @@ def main(args):
                 checkpoint_path,
             )
 
-        # EARLY STOPPING STRATEGY
+        # ------------------- EARLY STOPPING STRATEGY
         if v_mIoU > best_miou:
             best_miou = v_mIoU
             epochs_without_improvement = 0
-            # On sauvegarde le "Best Model"
             best_checkpoint_path = os.path.join(args.checkpoint_dir, f"best_model_{args.id}.pth")
             torch.save(model.state_dict(), best_checkpoint_path)
         else:
@@ -291,10 +278,6 @@ def main(args):
 
 if __name__ == "__main__":
 
-    # os.environ ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
-    # /zhome/f0/d/223076
-    # current_dir = "Final_Project/DTU_ADLCV_attention_surgeon_grp10/DPT_segmentation"
-    # annotations/training
     current_file = Path(__file__).resolve()
     project_root = current_file.parent.parent.parent.parent.parent.parent
 
@@ -362,9 +345,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.mode == "test":
-        #train, val = get_loaders(
-        #args.data_dir, args.batch_size, args.num_workers, use_features=args.features
-        #)
+        
         img_dir = args.data_dir + '/images'
         print("image directory : ", img_dir)
         mask_dir = args.data_dir + '/annotations'
@@ -377,7 +358,7 @@ if __name__ == "__main__":
         main(args)
 
     elif args.mode == "generate_feature_dataset" :
-
+        # Generate the feature dataset by taking the output of ADE20K images through the ViT
         print("args.data_dir : ",args.data_dir)
         model = DinoSegmenter(args.device, num_classes=150).to(args.device) 
         img_dir = os.path.join(project_root, args.data_dir, 'images', args.process_type) 
@@ -389,21 +370,22 @@ if __name__ == "__main__":
         ADE20K_through_ViT(model = model, dataloader=dataloader, data_dir=output_dir, device = args.device, process_type=args.process_type)
 
     elif args.mode == "inference":
-
+        # Inference on using the segmentation model
         current_directory = "Final_Project/DTU_ADLCV_attention_surgeon_grp10/DPT_segmentation"
         img_dir = os.path.join(current_directory,"data","images")
         mask_dir = os.path.join(current_directory,"data","annotations")
         feature_img_dir = os.path.join(current_directory,"data","feature_images")
         preprocessed_mask_dir = os.path.join(current_directory,"data","preprocessed_masks")
-        model_path = os.path.join(current_directory,"models","dino_segmenter_id01_ep20_100_bs32_lr0.0001.pth")
+        model_path = os.path.join(current_directory,"models_segmentation","dino_segmenter_id03_ep15_100_bs32_lr0.0001.pth")
 
         dataset0 = ADE20KDataset(img_dir=img_dir, mask_dir=mask_dir, return_name = False)
         dataset1 = ADE20KFeatureDataset(feature_images_dir=feature_img_dir, preprocessed_masks_dir=preprocessed_mask_dir,return_name=False)
-        dataloader0 = DataLoader(dataset0, shuffle=False, batch_size=args.batch_size)
-        dataloader1 = DataLoader(dataset1, shuffle=False, batch_size=args.batch_size)
+        dataloader0 = iter(DataLoader(dataset0, shuffle=False, batch_size=args.batch_size))
+        dataloader1 = iter(DataLoader(dataset1, shuffle=False, batch_size=args.batch_size))
 
-        img, mask, _ = next(iter(dataloader0))
-        ft_img, _ = next(iter(dataloader1))
+        for k in range(1): # change the range to get different images and the batch_size to vizualize more or less at the same time
+            img, mask, _ = next(dataloader0)
+            ft_img, _ = next(dataloader1)
 
         model = DinoSegmenter(args.device, num_classes=150).to(args.device)
         model_weights = torch.load(model_path, map_location = torch.device('cpu'))["model_state_dict"] 
@@ -414,27 +396,36 @@ if __name__ == "__main__":
         print("shape of output : ", outputs.shape)
         print("shape of mask : ", mask.shape)
 
-        def plot_batch(images, masks, outputs, batch_size):
-            batch_size = images.size(0)
-            fig, axes = plt.subplots(batch_size, 3, figsize=(10, 5 * batch_size))
+        def plot_batch(images, masks, outputs, batch_size=None):
             
-            for i in range(batch_size):
-                img = images[i].detach().permute(1, 2, 0).numpy()  # Convert to HWC
-                mask = masks[i].detach().numpy()  # Mask is already in HWC format
-                output = outputs[i]
+            actual_batch_size = images.size(0)
+            
+            fig, axes = plt.subplots(actual_batch_size, 3, figsize=(12, 4 * actual_batch_size), squeeze=False)
+            
+            for i in range(actual_batch_size):
                 
+                img = images[i].detach().cpu().permute(1, 2, 0).numpy()
+                
+                mask = masks[i].detach().cpu().numpy()
+                output = outputs[i].detach().cpu().numpy() if hasattr(outputs[i], 'detach') else outputs[i]
+                
+                # Images 
                 axes[i, 0].imshow(img)
-                axes[i, 0].set_title("Image")
+                axes[i, 0].set_title(f"Image {i+1}", fontsize=10)
                 axes[i, 0].axis('off')
                 
+                # Ground Truth 
                 axes[i, 1].imshow(mask)
-                axes[i, 1].set_title("Mask")
+                axes[i, 1].set_title(f"Ground Truth {i+1}", fontsize=10)
                 axes[i, 1].axis('off')
 
+                # Inference
                 axes[i, 2].imshow(output)
-                axes[i, 2].set_title("Inference")
+                axes[i, 2].set_title(f"Inference {i+1}", fontsize=10)
                 axes[i, 2].axis('off')
             
+            
+            plt.subplots_adjust(wspace=0.1, hspace=0.3)
             plt.tight_layout()
             plt.show()
 
@@ -446,10 +437,13 @@ if __name__ == "__main__":
 
         
 
-# command to run the script:
+# commands to run the script:
 
 # ---- TRAINING ----
-# python3 ./Final_Project/DTU_ADLCV_attention_surgeon_grp10/DPT_segmentation/segmentation.py train --id 00 --epochs 3  
+# python3 segmentation.py train --id 00 ...
 
 # ---- GENERATE FEATURE DATASET ----
-# python3 segmentation.py generate_feature_dataset --batch_size 128 --device cuda --num_workers 10 --process_type validation --output_dir /dtu/blackhole/04/223076/ADE20KFeatureDataset/data
+# python3 segmentation.py generate_feature_dataset --batch_size 128 --device cuda --num_workers 10 --process_type validation --output_dir <output_dir_path>
+
+# ---- PERFORM INFERENCE ----
+# python3 segmentation.py inference --batch_size 4
