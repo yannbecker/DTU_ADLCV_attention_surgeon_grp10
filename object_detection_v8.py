@@ -48,7 +48,6 @@ try:
     from ultralytics.nn.modules.head import Detect
     from ultralytics.nn.modules.block import C2f
     from ultralytics.utils.loss import v8DetectionLoss
-    from ultralytics.utils.ops import non_max_suppression
     ULTRALYTICS_OK = True
 except ImportError:
     ULTRALYTICS_OK = False
@@ -56,6 +55,9 @@ except ImportError:
         "ultralytics is required: pip install ultralytics\n"
         "On the HPC: pip install ultralytics --user"
     )
+
+# NMS via torchvision — no ultralytics dependency for inference
+from torchvision.ops import batched_nms
 
 # ── Project imports ───────────────────────────────────────────────────────────
 from classification import DinoClassifier
@@ -332,7 +334,48 @@ def train_one_epoch(
 
 
 # =============================================================================
-# 6.  EVALUATION
+# 6.  DECODE + NMS  (no ultralytics ops dependency)
+# =============================================================================
+
+def _decode_and_nms(
+    raw_out,
+    conf_thres: float = 0.01,
+    iou_thres:  float = 0.45,
+    max_det:    int   = 300,
+) -> list[torch.Tensor]:
+    """
+    Decode Detect eval output and apply per-class NMS.
+
+    raw_out: (y, preds_dict) tuple from Detect in eval mode, or just y.
+        y: (B, 4+nc, total_anchors)
+           channels  0:4  — xyxy boxes in input-image pixel space (224px)
+           channels  4:   — class probabilities (already sigmoid-ed by Detect)
+
+    Returns: list of (N, 6) float tensors  [x1, y1, x2, y2, score, cls_idx]
+             one tensor per image in the batch, N = kept detections.
+    """
+    pred = raw_out[0] if isinstance(raw_out, (tuple, list)) else raw_out
+
+    results = []
+    for p in pred:                          # iterate over batch dimension
+        boxes   = p[:4].T                  # (total_anchors, 4) xyxy
+        probs   = p[4:]                    # (nc, total_anchors) — already sigmoid
+        scores, cls_ids = probs.max(dim=0) # (total_anchors,) each
+
+        mask = scores > conf_thres
+        if not mask.any():
+            results.append(torch.zeros((0, 6), device=pred.device))
+            continue
+
+        b, s, c = boxes[mask], scores[mask], cls_ids[mask]
+        keep    = batched_nms(b, s, c, iou_thres)[:max_det]
+        results.append(torch.cat([b[keep], s[keep, None], c[keep, None].float()], dim=1))
+
+    return results
+
+
+# =============================================================================
+# 7.  EVALUATION
 # =============================================================================
 
 def evaluate(
@@ -343,7 +386,7 @@ def evaluate(
 ) -> tuple[float, float]:
     """
     COCOeval mAP.  Returns (mAP@0.5, mAP@0.5:0.95).
-    Uses non_max_suppression from ultralytics for clean decoding.
+    Decoding and NMS use torchvision.ops.batched_nms — no ultralytics ops needed.
     """
     if not COCO_EVAL_AVAILABLE:
         print("pycocotools not found — mAP skipped.")
@@ -365,15 +408,9 @@ def evaluate(
             batch_data = batch_data.to(device)
             out = model(batch_data)    # eval mode: (decoded_preds, raw_dict)
 
-            # non_max_suppression handles tuple input → takes out[0] automatically
-            # out[0]: (B, 4+nc, total_anchors) in 224px space
-            dets = non_max_suppression(
-                out,
-                conf_thres=0.01,    # low threshold: COCOeval sweeps confidence
-                iou_thres=0.45,
-                nc=NUM_CLASSES,
-                max_det=300,
-            )
+            # out: (decoded_preds, raw_dict) from Detect eval mode
+            # decoded_preds: (B, 4+nc, total_anchors) in 224px pixel space
+            dets = _decode_and_nms(out, conf_thres=0.01, iou_thres=0.45, max_det=300)
             # dets: list of (N, 6) tensors  [x1, y1, x2, y2, score, cls_idx]  (224px)
 
             if coco_gt is None:
