@@ -246,9 +246,10 @@ def yolo_loss(
     targets:      list[dict],
     anchors:      torch.Tensor,
     device:       torch.device,
-    lambda_coord: float = 5.0,
-    lambda_cls:   float = 1.0,
-    lambda_noobj: float = 0.5,    # ← YOLOv3 paper §2.2
+    lambda_coord: float = 10.0,   # higher than YOLOv3's 5 because we now use mean
+    lambda_cls:   float = 0.5,    # reduced from 1.0: BCEWithLogitsLoss averages over
+                                  # all 80 classes per cell, diluting the positive signal
+    lambda_noobj: float = 0.5,    # ← YOLOv3 paper §2.2 (unchanged, already consistent)
     ignore_thresh: float = 0.5,   # ← YOLOv3 paper §2.2
 ) -> torch.Tensor:
 
@@ -294,7 +295,7 @@ def yolo_loss(
             if 0 <= cls_idx < C:
                 tgt_cls[b_idx, a, gj_, gi_, cls_idx] = 1.0
 
-    mse        = nn.MSELoss(reduction="sum")
+    mse        = nn.MSELoss(reduction="mean")   # mean keeps scale independent of N_pos
     bce_elem   = nn.BCELoss(reduction="none")
     bce_logits = nn.BCEWithLogitsLoss()
 
@@ -317,8 +318,8 @@ def yolo_loss(
             torch.sigmoid(predictions[..., 1]),
         ], dim=-1)
         pred_wh  = predictions[..., 2:4]
-        loss_xy  = mse(pred_xy[obj_mask], tgt_xy[obj_mask]) / B
-        loss_wh  = mse(pred_wh[obj_mask], tgt_wh[obj_mask]) / B
+        loss_xy  = mse(pred_xy[obj_mask], tgt_xy[obj_mask])
+        loss_wh  = mse(pred_wh[obj_mask], tgt_wh[obj_mask])
         loss_cls = bce_logits(predictions[..., 5:][obj_mask], tgt_cls[obj_mask])
     else:
         loss_xy  = torch.tensor(0., device=device)
@@ -364,7 +365,7 @@ def decode_predictions(
                     if obj < conf_thresh:
                         continue
 
-                    cls_probs         = torch.softmax(p[5:], dim=0)
+                    cls_probs         = torch.sigmoid(p[5:])   # BCE-trained: independent per class
                     cls_score, cls_label = cls_probs.max(0)
                     final_score       = obj * cls_score.item()
                     if final_score < conf_thresh:
@@ -723,6 +724,12 @@ def evaluate(
                 detections = decode_predictions(preds, model.anchors)
                 for det, tgt in zip(detections, targets):
                     img_id = tgt["image_id"]
+                    # decode_predictions outputs boxes in IMG_SIZE (224px) space;
+                    # COCOeval compares against GT in original image pixel space.
+                    # Scale factor converts 224px coords → original image coords.
+                    img_info = coco_gt.imgs[img_id]
+                    sx = img_info["width"]  / IMG_SIZE
+                    sy = img_info["height"] / IMG_SIZE
                     for k in range(len(det["scores"])):
                         box   = det["boxes"][k]
                         score = det["scores"][k].item()
@@ -730,9 +737,12 @@ def evaluate(
                         coco_results.append({
                             "image_id":    img_id,
                             "category_id": IDX_TO_CAT[label],
-                            "bbox": [box[0].item(), box[1].item(),
-                                     (box[2]-box[0]).item(),
-                                     (box[3]-box[1]).item()],
+                            "bbox": [
+                                box[0].item() * sx,
+                                box[1].item() * sy,
+                                (box[2] - box[0]).item() * sx,
+                                (box[3] - box[1]).item() * sy,
+                            ],
                             "score": score,
                         })
 
