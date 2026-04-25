@@ -6,6 +6,8 @@ checkpoints*/
 *.out
 *.err
 test_*.py
+models_segmentation/
+test.py
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
