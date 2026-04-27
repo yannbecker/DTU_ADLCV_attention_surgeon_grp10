@@ -33,6 +33,7 @@
 
 import os
 import types
+import random
 import argparse
 
 import torch
@@ -294,7 +295,40 @@ def _targets_to_batch(targets: list[dict], device: torch.device) -> dict:
 
 
 # =============================================================================
-# 5.  TRAINING LOOP
+# 5.  FEATURE AUGMENTATION  (applied to cached features before each forward)
+# =============================================================================
+
+def augment_features(
+    feats:   torch.Tensor,
+    targets: list[dict],
+) -> tuple[torch.Tensor, list[dict]]:
+    """
+    Random horizontal flip on (B, 768, H, W) cached feature maps.
+
+    Flips the spatial W dimension and mirrors x-coordinates of bounding boxes
+    (which are stored in normalised xyxy format [0, 1]).
+    50 % probability per image in the batch.
+    """
+    aug_feats, aug_targets = [], []
+    for i in range(feats.size(0)):
+        feat = feats[i]
+        tgt  = targets[i]
+        if random.random() < 0.5:
+            feat = feat.flip(-1)                    # flip W
+            boxes = tgt["boxes"].clone()
+            if boxes.numel() > 0:
+                x1_new = 1.0 - boxes[:, 2]
+                x2_new = 1.0 - boxes[:, 0]
+                boxes[:, 0] = x1_new
+                boxes[:, 2] = x2_new
+            tgt = {**tgt, "boxes": boxes}
+        aug_feats.append(feat)
+        aug_targets.append(tgt)
+    return torch.stack(aug_feats), aug_targets
+
+
+# =============================================================================
+# 6.  TRAINING LOOP
 # =============================================================================
 
 def train_one_epoch(
@@ -313,7 +347,8 @@ def train_one_epoch(
 
     for batch_data, targets in tqdm(loader, desc="Train", leave=False):
         batch_data = batch_data.to(device)
-        preds      = model(batch_data)          # training mode → dict
+        batch_data, targets = augment_features(batch_data, targets)
+        preds      = model(batch_data)          # training mode → list of feature tensors
 
         batch = _targets_to_batch(targets, device)
         loss, items = criterion(preds, batch)   # items: [box, cls, dfl]
@@ -334,7 +369,7 @@ def train_one_epoch(
 
 
 # =============================================================================
-# 6.  DECODE + NMS  (no ultralytics ops dependency)
+# 7.  DECODE + NMS  (no ultralytics ops dependency)
 # =============================================================================
 
 def _decode_and_nms(
@@ -375,7 +410,7 @@ def _decode_and_nms(
 
 
 # =============================================================================
-# 7.  EVALUATION
+# 8.  EVALUATION
 # =============================================================================
 
 def evaluate(
@@ -447,7 +482,7 @@ def evaluate(
 
 
 # =============================================================================
-# 7.  MAIN
+# 9.  MAIN
 # =============================================================================
 
 def main(args: argparse.Namespace) -> None:
@@ -490,15 +525,27 @@ def main(args: argparse.Namespace) -> None:
         print(f"Resumed: {args.checkpoint}")
 
     # ── Optimise neck + head only (backbone is frozen) ───────────────────────
-    trainable  = list(model.neck.parameters()) + list(model.head.parameters())
-    optimizer  = torch.optim.AdamW(trainable, lr=args.lr, weight_decay=1e-4)
-    scheduler  = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=args.epochs, eta_min=1e-5
+    trainable = list(model.neck.parameters()) + list(model.head.parameters())
+    optimizer = torch.optim.AdamW(trainable, lr=args.lr, weight_decay=1e-4)
+
+    # Linear warmup for warmup_epochs, then cosine decay to eta_min=1e-5.
+    warmup_epochs = args.warmup_epochs
+    warmup = torch.optim.lr_scheduler.LinearLR(
+        optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_epochs
     )
-    criterion  = _build_criterion(model.head, device)
+    cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=max(1, args.epochs - warmup_epochs), eta_min=1e-5
+    )
+    scheduler = torch.optim.lr_scheduler.SequentialLR(
+        optimizer, schedulers=[warmup, cosine], milestones=[warmup_epochs]
+    )
+    criterion = _build_criterion(model.head, device)
 
     train_losses, map50_list = [], []
     best_map50 = 0.0
+    # Patience counter only starts after burn_in epochs so that early stopping
+    # doesn't fire before the model has had time to calibrate confidence scores.
+    burn_in    = max(warmup_epochs, 15)
     no_improve = 0
 
     for epoch in range(args.epochs):
@@ -511,8 +558,10 @@ def main(args: argparse.Namespace) -> None:
         train_losses.append(t_loss)
         map50_list.append(map50)
 
+        current_lr = optimizer.param_groups[0]["lr"]
         print(
             f"Epoch {epoch+1:02d}/{args.epochs} | "
+            f"LR {current_lr:.2e} | "
             f"Loss {t_loss:.3f}  box {box_l:.3f}  cls {cls_l:.3f}  dfl {dfl_l:.3f} | "
             f"mAP@0.5 {map50:.4f}  mAP@0.5:0.95 {map50_95:.4f}"
         )
@@ -534,7 +583,9 @@ def main(args: argparse.Namespace) -> None:
                 "map50_95": map50_95,
             }, os.path.join(args.checkpoint_dir, "dinov8_coco_best.pth"))
             print(f"  ↑ Best mAP@0.5: {best_map50:.4f} saved.")
-        else:
+        elif epoch >= burn_in:
+            # Only count patience after the burn-in period: mAP is ~0
+            # for the first ~15 epochs and would otherwise trigger early stop.
             no_improve += 1
 
         if no_improve >= args.patience:
@@ -555,7 +606,7 @@ def main(args: argparse.Namespace) -> None:
 
 
 # =============================================================================
-# 8.  CLI
+# 10. CLI
 # =============================================================================
 
 if __name__ == "__main__":
@@ -569,10 +620,13 @@ if __name__ == "__main__":
         default=os.path.join(os.environ.get("BLACKHOLE", "."), "COCO_features"))
     p.add_argument("--checkpoint_dir", default="checkpoints/")
     p.add_argument("--checkpoint",     default=None)
-    p.add_argument("--epochs",         type=int,   default=40)
+    p.add_argument("--epochs",         type=int,   default=60)
     p.add_argument("--batch_size",     type=int,   default=32)
-    p.add_argument("--lr",             type=float, default=1e-3)
-    p.add_argument("--patience",       type=int,   default=15)
+    p.add_argument("--lr",             type=float, default=3e-4)
+    p.add_argument("--warmup_epochs",  type=int,   default=5,
+        help="Linear LR warmup from lr/10 over this many epochs.")
+    p.add_argument("--patience",       type=int,   default=30,
+        help="Early-stop patience counted only after a 15-epoch burn-in.")
     p.add_argument("--num_workers",    type=int,   default=4)
     p.add_argument("--device",         default=None)
     main(p.parse_args())

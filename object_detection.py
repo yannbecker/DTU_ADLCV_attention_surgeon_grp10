@@ -364,7 +364,7 @@ def decode_predictions(
                     if obj < conf_thresh:
                         continue
 
-                    cls_probs         = torch.softmax(p[5:], dim=0)
+                    cls_probs         = torch.sigmoid(p[5:])
                     cls_score, cls_label = cls_probs.max(0)
                     final_score       = obj * cls_score.item()
                     if final_score < conf_thresh:
