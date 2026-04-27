@@ -73,7 +73,12 @@ def train_one_epoch(
         imgs, targets = batch
         imgs = imgs.to(device)                               # (B, 3, 518, 518)
 
-        preds = model(imgs)                                  # training: list of tensors
+        # Backbone is frozen — run it without autograd to save memory and time.
+        # head([feat]) below still builds a graph through the head parameters.
+        with torch.no_grad():
+            feat = model.extract_features(imgs)              # (B, 768, 37, 37)
+        feat = feat.detach()
+        preds = model.head([feat])                           # training: list of tensors
 
         batch_dict = _build_batch_dict(targets, device)
         loss_raw, items = criterion(preds, batch_dict)
