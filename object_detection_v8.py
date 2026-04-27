@@ -351,7 +351,10 @@ def train_one_epoch(
         preds      = model(batch_data)          # training mode → list of feature tensors
 
         batch = _targets_to_batch(targets, device)
-        loss, items = criterion(preds, batch)   # items: [box, cls, dfl]
+        loss_raw, items = criterion(preds, batch)
+        # v8DetectionLoss returns either a scalar or a 3-element [box,cls,dfl]
+        # vector depending on the ultralytics version; always reduce to scalar.
+        loss = loss_raw.sum()
 
         optimizer.zero_grad()
         loss.backward()
@@ -362,7 +365,7 @@ def train_one_epoch(
         optimizer.step()
 
         totals[0] += loss.item()
-        totals[1:] += items.detach().cpu()
+        totals[1:] += items.detach().cpu()[:3]
 
     n = len(loader)
     return (totals[0]/n).item(), (totals[1]/n).item(), (totals[2]/n).item(), (totals[3]/n).item()
