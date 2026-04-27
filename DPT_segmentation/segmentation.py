@@ -376,19 +376,20 @@ if __name__ == "__main__":
         mask_dir = os.path.join(current_directory,"data","annotations")
         feature_img_dir = os.path.join(current_directory,"data","feature_images")
         preprocessed_mask_dir = os.path.join(current_directory,"data","preprocessed_masks")
-        model_path = os.path.join(current_directory,"models_segmentation","dino_segmenter_id03_ep15_100_bs32_lr0.0001.pth")
+        model_path = os.path.join(current_directory,"models_segmentation","best_model_03.pth" )#"dino_segmenter_id03_ep30_100_bs32_lr0.0001.pth")
 
         dataset0 = ADE20KDataset(img_dir=img_dir, mask_dir=mask_dir, return_name = False)
         dataset1 = ADE20KFeatureDataset(feature_images_dir=feature_img_dir, preprocessed_masks_dir=preprocessed_mask_dir,return_name=False)
         dataloader0 = iter(DataLoader(dataset0, shuffle=False, batch_size=args.batch_size))
         dataloader1 = iter(DataLoader(dataset1, shuffle=False, batch_size=args.batch_size))
 
-        for k in range(1): # change the range to get different images and the batch_size to vizualize more or less at the same time
+        for k in range(3): # change the range to get different images and the batch_size to vizualize more or less at the same time
             img, mask, _ = next(dataloader0)
-            ft_img, _ = next(dataloader1)
+            ft_img, prepro_mask = next(dataloader1)
 
         model = DinoSegmenter(args.device, num_classes=150).to(args.device)
-        model_weights = torch.load(model_path, map_location = torch.device('cpu'))["model_state_dict"] 
+        # model_weights = torch.load(model_path, map_location = torch.device('cpu'))["model_state_dict"] 
+        model_weights = torch.load(model_path, map_location = torch.device('cpu'))
         model.load_state_dict(model_weights)
 
         _, outputs = model(ft_img, features = True)
@@ -396,40 +397,41 @@ if __name__ == "__main__":
         print("shape of output : ", outputs.shape)
         print("shape of mask : ", mask.shape)
 
-        def plot_batch(images, masks, outputs, batch_size=None):
-            
+        def plot_batch(images, masks, outputs, prepro_masks):
+            # S'assurer qu'on traite bien le nombre d'images présentes
             actual_batch_size = images.size(0)
             
-            fig, axes = plt.subplots(actual_batch_size, 3, figsize=(12, 4 * actual_batch_size), squeeze=False)
+            # Correction de figsize : (largeur, hauteur) 
+            # Pour 2 lignes, (15, 6) est généralement plus équilibré
+            fig, axes = plt.subplots(2, actual_batch_size, figsize=(actual_batch_size * 3, 6), squeeze=False)
             
             for i in range(actual_batch_size):
+                # 1. Extraction et conversion CPU/Numpy
+                # Ground Truth
+                gt = prepro_masks[i].detach().cpu().squeeze().numpy()
                 
-                img = images[i].detach().cpu().permute(1, 2, 0).numpy()
-                
-                mask = masks[i].detach().cpu().numpy()
-                output = outputs[i].detach().cpu().numpy() if hasattr(outputs[i], 'detach') else outputs[i]
-                
-                # Images 
-                axes[i, 0].imshow(img)
-                axes[i, 0].set_title(f"Image {i+1}", fontsize=10)
-                axes[i, 0].axis('off')
-                
-                # Ground Truth 
-                axes[i, 1].imshow(mask)
-                axes[i, 1].set_title(f"Ground Truth {i+1}", fontsize=10)
-                axes[i, 1].axis('off')
+                # Inference : On prend l'Argmax sur la dimension des classes (souvent dim=0 ou dim=1)
+                # Si output est (C, H, W), on fait argmax(0)
+                res = outputs[i].detach().cpu()
+                if res.ndim == 3: # Si (Classes, H, W)
+                    res = res.argmax(dim=0)
+                res = res.numpy()
 
-                # Inference
-                axes[i, 2].imshow(output)
-                axes[i, 2].set_title(f"Inference {i+1}", fontsize=10)
-                axes[i, 2].axis('off')
+                # 2. Affichage Ground Truth
+                axes[0, i].imshow(gt)
+                axes[0, i].set_title(f"GT {i+1}", fontsize=10)
+                axes[0, i].axis('off')
+
+                # 3. Affichage Inference
+                # On utilise le même cmap que la GT pour pouvoir comparer
+                axes[1, i].imshow(res)
+                axes[1, i].set_title(f"Pred {i+1}", fontsize=10)
+                axes[1, i].axis('off')
             
-            
-            plt.subplots_adjust(wspace=0.1, hspace=0.3)
             plt.tight_layout()
             plt.show()
 
-        plot_batch(img, mask, outputs, args.batch_size)
+        plot_batch(img, mask, prepro_masks=prepro_mask,outputs= outputs)
 
         
 

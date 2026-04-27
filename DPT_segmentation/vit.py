@@ -3,7 +3,7 @@ import torch.nn as nn
 import types
 import math
 import torch.nn.functional as F
-from utils import load_model # Load DINOv2 function
+
 
 activations = {}
 
@@ -359,7 +359,9 @@ def _make_vit_b14_backbone(
 
     return pretrained
 
-
+def load_model(device="cpu"):
+    model = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitb14_reg').to(device) # Dinov2 ViT-B/14 (16 does not exist)
+    return model
 
 
 def _make_pretrained_vitb14_224(
