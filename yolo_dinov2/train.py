@@ -1,0 +1,481 @@
+# =============================================================================
+# yolo_dinov2/train.py — AttentionSurgeon: training script for
+#                        DINOv2 ViT-B/14-reg + YOLOv8 Detect head (518×518)
+# =============================================================================
+# Architecture:
+#   DINOv2 ViT-B/14-reg (frozen)          → (B, 768, 37, 37)
+#   Single-scale Detect head (trainable)  stride=14, 37×37 feature grid
+#
+# Training strategy:
+#   - Raw COCO images (518×518 float32 [0,1]) so real augmentation is applied.
+#   - Backbone normalises internally; we only optimise the Detect head.
+#   - Loss: v8DetectionLoss (ultralytics). Always call loss_raw.sum() before
+#     .backward() because different ultralytics versions return either a scalar
+#     or a 3-element [box, cls, dfl] vector.
+#   - Linear LR warmup → cosine decay; early stopping with burn-in period
+#     (mAP does not appear until ~15–20 epochs).
+#
+# Usage:
+#   python -m yolo_dinov2.train --datadir $BLACKHOLE/COCO
+# =============================================================================
+
+from __future__ import annotations
+
+import os
+import argparse
+
+import torch
+import torch.nn as nn
+import matplotlib.pyplot as plt
+
+from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
+
+from .detector import DinoPrunableDetector, build_criterion, _build_batch_dict
+from .dataset  import get_coco_loaders_v2, IDX_TO_CAT, IMG_SIZE
+
+try:
+    from pycocotools.coco import COCO
+    from pycocotools.cocoeval import COCOeval
+    COCO_OK = True
+except ImportError:
+    COCO_OK = False
+
+try:
+    from torchvision.ops import batched_nms
+    NMS_OK = True
+except ImportError:
+    NMS_OK = False
+
+
+# =============================================================================
+# 1.  TRAINING LOOP
+# =============================================================================
+
+def train_one_epoch(
+    model:     DinoPrunableDetector,
+    criterion,
+    loader:    DataLoader,
+    optimizer: torch.optim.Optimizer,
+    device:    torch.device,
+) -> tuple[float, float, float, float]:
+    """
+    One training epoch over raw COCO images.
+
+    Returns:
+        (avg_total_loss, avg_box_loss, avg_cls_loss, avg_dfl_loss)
+    """
+    model.train()
+    totals = torch.zeros(4)   # [total, box, cls, dfl]
+    n = len(loader)
+
+    for batch in tqdm(loader, desc="Train", leave=False):
+        imgs, targets = batch
+        imgs = imgs.to(device)                               # (B, 3, 518, 518)
+
+        preds = model(imgs)                                  # training: list of tensors
+
+        batch_dict = _build_batch_dict(targets, device)
+        loss_raw, items = criterion(preds, batch_dict)
+
+        # v8DetectionLoss may return a scalar or a 3-element vector depending
+        # on the ultralytics version.  Always reduce to scalar before backward.
+        loss: torch.Tensor = loss_raw.sum()
+
+        optimizer.zero_grad()
+        loss.backward()
+        nn.utils.clip_grad_norm_(
+            list(model.head.parameters()),
+            max_norm=10.0,
+        )
+        optimizer.step()
+
+        totals[0] += loss.item()
+        totals[1:] += items.detach().cpu()[:3]
+
+    return (
+        (totals[0] / n).item(),
+        (totals[1] / n).item(),
+        (totals[2] / n).item(),
+        (totals[3] / n).item(),
+    )
+
+
+# =============================================================================
+# 2.  DECODE + NMS
+# =============================================================================
+
+def decode_v8_output(
+    raw_out,
+    conf_thres: float = 0.01,
+    iou_thres:  float = 0.45,
+    max_det:    int   = 300,
+) -> list[torch.Tensor]:
+    """
+    Decode the ultralytics Detect head output and apply per-class NMS.
+
+    The Detect head in eval mode returns ``(y, x_dict)`` where ``y`` has
+    shape ``(B, 4 + nc, total_anchors)``:
+        - channels 0:4  — xyxy boxes in *input-image pixel space* (518 px)
+        - channels 4:   — class probabilities, already sigmoid-ed by Detect
+
+    Args:
+        raw_out:    Output of DinoPrunableDetector in eval mode.
+                    Either ``(y, x_dict)`` or just ``y``.
+        conf_thres: Minimum class score to keep a candidate box.
+        iou_thres:  IoU threshold for NMS.
+        max_det:    Maximum detections per image.
+
+    Returns:
+        List of length B.  Each element is a FloatTensor of shape (N, 6):
+        ``[x1, y1, x2, y2, score, cls_idx]``  with coords in 518-px space.
+
+    Raises:
+        ImportError: if torchvision is not available.
+    """
+    if not NMS_OK:
+        raise ImportError(
+            "torchvision is required for NMS: pip install torchvision"
+        )
+
+    # Accept both (y, x_dict) tuple (eval mode) and plain tensor (training mode)
+    pred: torch.Tensor = raw_out[0] if isinstance(raw_out, (tuple, list)) else raw_out
+
+    results: list[torch.Tensor] = []
+
+    for p in pred:                           # iterate over batch dimension (B, 4+nc, A)
+        boxes   = p[:4].T                    # (A, 4)  xyxy in 518-px space
+        probs   = p[4:]                      # (nc, A) already sigmoid
+        scores, cls_ids = probs.max(dim=0)   # (A,) each
+
+        mask = scores > conf_thres
+        if not mask.any():
+            results.append(torch.zeros((0, 6), device=pred.device))
+            continue
+
+        b = boxes[mask]
+        s = scores[mask]
+        c = cls_ids[mask]
+
+        keep = batched_nms(b, s, c, iou_thres)[:max_det]
+
+        det = torch.cat(
+            [b[keep], s[keep, None], c[keep, None].float()],
+            dim=1,
+        )                                    # (N, 6)
+        results.append(det)
+
+    return results
+
+
+# =============================================================================
+# 3.  EVALUATION  (COCO mAP)
+# =============================================================================
+
+def evaluate_v2(
+    model:   DinoPrunableDetector,
+    loader:  DataLoader,
+    device:  torch.device,
+    datadir: str | None = None,
+) -> tuple[float, float]:
+    """
+    Official COCOeval mAP on the val split.
+
+    Boxes from the Detect head are in 518-px space (xyxy).  We scale them
+    back to original image coordinates before adding to coco_results so that
+    COCOeval compares in the correct coordinate system.
+
+    Returns:
+        (mAP@0.5,  mAP@0.5:0.95)
+        Both are 0.0 if pycocotools is unavailable or no detections are made.
+    """
+    if not COCO_OK:
+        print("pycocotools not found — mAP skipped.")
+        return 0.0, 0.0
+
+    model.eval()
+    coco_results: list[dict] = []
+
+    # Resolve COCO ground truth object
+    coco_gt: COCO | None = getattr(loader.dataset, "coco", None)
+    if coco_gt is None and datadir is not None:
+        ann_file = os.path.join(datadir, "annotations", "instances_val2017.json")
+        if os.path.exists(ann_file):
+            coco_gt = COCO(ann_file)
+        else:
+            print(f"Annotation file not found at {ann_file} — mAP skipped.")
+
+    with torch.no_grad():
+        for batch in tqdm(loader, desc="Eval", leave=False):
+            imgs, targets = batch
+            imgs = imgs.to(device)
+
+            out  = model(imgs)                           # eval: (y, x_dict)
+            dets = decode_v8_output(out, conf_thres=0.01, iou_thres=0.45, max_det=300)
+
+            if coco_gt is None:
+                continue
+
+            for det, tgt in zip(dets, targets):
+                img_id   = tgt["image_id"]
+                img_info = coco_gt.imgs[img_id]
+
+                # Scale from 518-px space back to original image coordinates
+                sx = img_info["width"]  / IMG_SIZE
+                sy = img_info["height"] / IMG_SIZE
+
+                for row in det.tolist():
+                    x1, y1, x2, y2, score, cls_idx = row
+                    coco_results.append({
+                        "image_id":    img_id,
+                        "category_id": IDX_TO_CAT[int(cls_idx)],
+                        "bbox":        [
+                            x1 * sx,
+                            y1 * sy,
+                            (x2 - x1) * sx,
+                            (y2 - y1) * sy,
+                        ],
+                        "score": score,
+                    })
+
+    if not coco_results:
+        print("Warning: no detections above conf_thres=0.01 — mAP is 0.")
+        return 0.0, 0.0
+
+    if coco_gt is None:
+        return 0.0, 0.0
+
+    coco_dt   = coco_gt.loadRes(coco_results)
+    coco_eval = COCOeval(coco_gt, coco_dt, "bbox")
+    coco_eval.evaluate()
+    coco_eval.accumulate()
+    coco_eval.summarize()
+
+    map50_95 = float(coco_eval.stats[0])   # IoU=0.50:0.95
+    map50    = float(coco_eval.stats[1])   # IoU=0.50
+
+    return map50, map50_95
+
+
+# =============================================================================
+# 4.  MAIN
+# =============================================================================
+
+def main(args: argparse.Namespace) -> None:
+    # ── Device ───────────────────────────────────────────────────────────────
+    device = torch.device(
+        args.device if args.device
+        else ("cuda" if torch.cuda.is_available() else "cpu")
+    )
+    print(f"Device: {device}")
+
+    # ── Model ─────────────────────────────────────────────────────────────────
+    model = DinoPrunableDetector(device=device).to(device)
+    # head.stride is not a buffer in ultralytics Detect — move manually
+    model.head.stride = model.head.stride.to(device)
+
+    # ── Resume from checkpoint ────────────────────────────────────────────────
+    os.makedirs(args.checkpoint_dir, exist_ok=True)
+    if args.checkpoint and os.path.exists(args.checkpoint):
+        ckpt = torch.load(args.checkpoint, map_location=device)
+        model.load_state_dict(ckpt["model_state_dict"])
+        print(f"Resumed from: {args.checkpoint}")
+
+    # ── Data ──────────────────────────────────────────────────────────────────
+    train_loader, val_loader = get_coco_loaders_v2(
+        args.datadir, args.batch_size, args.num_workers
+    )
+    print(
+        f"Train: {len(train_loader.dataset)} images | "
+        f"Val: {len(val_loader.dataset)} images"
+    )
+
+    # ── Optimiser: only Detect head — backbone is frozen ─────────────────────
+    optimizer = torch.optim.AdamW(
+        list(model.head.parameters()),
+        lr=args.lr,
+        weight_decay=1e-4,
+    )
+
+    # Linear warmup for warmup_epochs, then cosine decay to eta_min=1e-5
+    warmup_epochs = args.warmup_epochs
+    warmup_sched = torch.optim.lr_scheduler.LinearLR(
+        optimizer,
+        start_factor=0.1,
+        end_factor=1.0,
+        total_iters=warmup_epochs,
+    )
+    cosine_sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=max(1, args.epochs - warmup_epochs),
+        eta_min=1e-5,
+    )
+    scheduler = torch.optim.lr_scheduler.SequentialLR(
+        optimizer,
+        schedulers=[warmup_sched, cosine_sched],
+        milestones=[warmup_epochs],
+    )
+
+    criterion = build_criterion(model.head, device)
+
+    # ── Training state ────────────────────────────────────────────────────────
+    train_losses: list[float] = []
+    map50_list:   list[float] = []
+
+    # Early stopping burn-in: mAP is ~0 for the first 15–20 epochs because the
+    # head has not yet calibrated confidence scores.  Only start counting
+    # patience after the burn-in period ends.
+    burn_in    = max(warmup_epochs, 15)
+    best_map50 = 0.0
+    no_improve = 0
+
+    # ── Epoch loop ────────────────────────────────────────────────────────────
+    for epoch in range(args.epochs):
+        t_loss, box_l, cls_l, dfl_l = train_one_epoch(
+            model, criterion, train_loader, optimizer, device
+        )
+        map50, map50_95 = evaluate_v2(
+            model, val_loader, device, datadir=args.datadir
+        )
+        scheduler.step()
+
+        train_losses.append(t_loss)
+        map50_list.append(map50)
+
+        current_lr = optimizer.param_groups[0]["lr"]
+        print(
+            f"Epoch {epoch+1:02d}/{args.epochs} | "
+            f"LR {current_lr:.2e} | "
+            f"Loss {t_loss:.3f}  box {box_l:.3f}  cls {cls_l:.3f}  dfl {dfl_l:.3f} | "
+            f"mAP@0.5 {map50:.4f}  mAP@0.5:0.95 {map50_95:.4f}"
+        )
+
+        # Save latest checkpoint
+        torch.save(
+            {
+                "epoch":            epoch + 1,
+                "model_state_dict": model.state_dict(),
+                "map50":            map50,
+                "map50_95":         map50_95,
+            },
+            os.path.join(args.checkpoint_dir, "dinov2_coco_latest.pth"),
+        )
+
+        # Save best checkpoint and update patience counter
+        if map50 > best_map50 + 1e-4:
+            best_map50 = map50
+            no_improve  = 0
+            torch.save(
+                {
+                    "epoch":            epoch + 1,
+                    "model_state_dict": model.state_dict(),
+                    "map50":            map50,
+                    "map50_95":         map50_95,
+                },
+                os.path.join(args.checkpoint_dir, "dinov2_coco_best.pth"),
+            )
+            print(f"  Best mAP@0.5: {best_map50:.4f} saved.")
+        elif epoch >= burn_in:
+            # Only increment patience counter once the burn-in period has ended
+            no_improve += 1
+
+        if no_improve >= args.patience:
+            print(f"Early stop: no improvement for {args.patience} epochs.")
+            break
+
+    # ── Training curves ───────────────────────────────────────────────────────
+    os.makedirs("figure", exist_ok=True)
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
+    ep = range(1, len(train_losses) + 1)
+
+    ax1.plot(ep, train_losses)
+    ax1.set_title("Total Train Loss")
+    ax1.set_xlabel("Epoch")
+    ax1.set_ylabel("Loss")
+
+    ax2.plot(ep, map50_list, color="green")
+    ax2.set_title("mAP@0.5")
+    ax2.set_xlabel("Epoch")
+    ax2.set_ylabel("mAP")
+
+    plt.tight_layout()
+    plt.savefig("figure/trainval_curve_dinov2.jpg")
+    print("Curves saved → figure/trainval_curve_dinov2.jpg")
+
+
+# =============================================================================
+# 5.  CLI
+# =============================================================================
+
+if __name__ == "__main__":
+    p = argparse.ArgumentParser(
+        description="AttentionSurgeon — DINOv2 ViT-B/14-reg + YOLOv8 "
+                    "single-scale detection on COCO (518×518)"
+    )
+
+    # ── Paths ─────────────────────────────────────────────────────────────────
+    p.add_argument(
+        "--datadir",
+        default=os.path.join(os.environ.get("BLACKHOLE", "."), "COCO"),
+        help="COCO root directory (must contain train2017/, val2017/, annotations/).",
+    )
+    p.add_argument(
+        "--checkpoint_dir",
+        default="checkpoints/",
+        help="Directory to save checkpoint .pth files.",
+    )
+    p.add_argument(
+        "--checkpoint",
+        default=None,
+        help="Path to a checkpoint to resume training from.",
+    )
+
+    # ── Hyperparameters ───────────────────────────────────────────────────────
+    p.add_argument(
+        "--epochs",
+        type=int,
+        default=60,
+        help="Maximum number of training epochs.",
+    )
+    p.add_argument(
+        "--batch_size",
+        type=int,
+        default=16,
+        # 518×518 raw images use considerably more VRAM than 224×224 cached
+        # features, so default is lower than the v8 baseline.
+        help="Images per batch (default 16 — lower than v8 due to 518px VRAM cost).",
+    )
+    p.add_argument(
+        "--lr",
+        type=float,
+        default=3e-4,
+        help="Peak learning rate for AdamW (after linear warmup).",
+    )
+    p.add_argument(
+        "--warmup_epochs",
+        type=int,
+        default=5,
+        help="Number of linear LR warmup epochs (lr/10 → lr).",
+    )
+    p.add_argument(
+        "--patience",
+        type=int,
+        default=30,
+        help="Early-stopping patience (epochs without mAP improvement). "
+             "Patience counter only starts after the burn-in period (max(warmup, 15)).",
+    )
+
+    # ── Hardware ──────────────────────────────────────────────────────────────
+    p.add_argument(
+        "--num_workers",
+        type=int,
+        default=4,
+        help="DataLoader worker processes.",
+    )
+    p.add_argument(
+        "--device",
+        default=None,
+        help="Force compute device (e.g. cuda, mps, cpu). Auto-detected if omitted.",
+    )
+
+    main(p.parse_args())
