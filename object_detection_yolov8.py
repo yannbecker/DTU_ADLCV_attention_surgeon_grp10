@@ -11,7 +11,7 @@ import torchvision.transforms as T
 import matplotlib.pyplot as plt
 
 from torch.utils.data import Dataset, DataLoader
-from torchvision.ops import batched_nms
+from torchvision.ops import batched_nms, box_iou
 from tqdm.auto import tqdm
 from PIL import Image
 
@@ -306,12 +306,39 @@ def _decode_and_nms(raw_out, conf_thres=0.01, iou_thres=0.45, max_det=300):
     return results
 
 
+# ── Validation loss (train-mode subset pass) ──────────────────────────────────
+
+def _compute_val_loss(model, loader, criterion, device, n_batches=50):
+    """
+    Estimate val loss over the first n_batches batches.
+
+    Runs in train mode so the Detect head returns raw tensors (needed by the
+    loss).  BN stats are frozen to prevent corruption from val batches.
+    """
+    model.train()
+    for m in model.modules():
+        if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d)):
+            m.eval()
+    total, count = 0.0, 0
+    with torch.no_grad():
+        for i, (batch_data, targets) in enumerate(loader):
+            if i >= n_batches:
+                break
+            batch_data = batch_data.to(device)
+            preds = model(batch_data)
+            loss_raw, _ = criterion(preds, _targets_to_batch(targets, device))
+            total += loss_raw.sum().item()
+            count += 1
+    model.eval()
+    return total / count if count > 0 else 0.0
+
+
 # ── Evaluation ────────────────────────────────────────────────────────────────
 
 def evaluate(model, loader, device, datadir=None):
     if not COCO_EVAL_AVAILABLE:
         print("pycocotools not found — mAP skipped.")
-        return 0.0, 0.0
+        return 0.0, 0.0, 0.0
 
     model.eval()
     coco_results = []
@@ -323,21 +350,36 @@ def evaluate(model, loader, device, datadir=None):
             coco_gt = COCO(ann_file)
         else:
             print(f"[evaluate] ERROR: annotation file not found at {ann_file}. Returning mAP=0.")
-            return 0.0, 0.0
+            return 0.0, 0.0, 0.0
 
     if coco_gt is None:
         print("[evaluate] ERROR: no COCO ground-truth available. Pass --datadir. Returning mAP=0.")
-        return 0.0, 0.0
+        return 0.0, 0.0, 0.0
+
+    iou_sum:   float = 0.0
+    iou_count: int   = 0
 
     with torch.no_grad():
         for batch_data, targets in tqdm(loader, desc="Eval", leave=False):
             batch_data = batch_data.to(device)
             out  = model(batch_data)
-            dets = _decode_and_nms(out, conf_thres=0.01, iou_thres=0.45, max_det=300)
+            # Lower threshold — more candidates → more accurate COCOeval PR curve
+            dets = _decode_and_nms(out, conf_thres=0.001, iou_thres=0.45, max_det=300)
             for det, tgt in zip(dets, targets):
+                # ── Mean IoU ────────────────────────────────────────────────
+                gt_norm = tgt["boxes"]                          # (G, 4) normalised xyxy
+                if gt_norm.shape[0] > 0:
+                    gt_px = gt_norm * IMG_SIZE                  # scale to 224-px space
+                    gt_px = gt_px.to(device)
+                    if det.shape[0] > 0:
+                        iou_mat = box_iou(gt_px, det[:, :4])   # (G, N)
+                        iou_sum += iou_mat.max(dim=1).values.sum().item()
+                    iou_count += gt_norm.shape[0]
+
+                # ── COCOeval ─────────────────────────────────────────────────
                 img_id   = tgt["image_id"]
                 img_info = coco_gt.imgs[img_id]
-                sx = img_info["width"]  / IMG_SIZE   # convert 224px → original pixel space
+                sx = img_info["width"]  / IMG_SIZE
                 sy = img_info["height"] / IMG_SIZE
                 for row in det.tolist():
                     x1, y1, x2, y2, score, cls_idx = row
@@ -348,6 +390,7 @@ def evaluate(model, loader, device, datadir=None):
                         "score": score,
                     })
 
+    mean_iou        = iou_sum / iou_count if iou_count > 0 else 0.0
     map50 = map50_95 = 0.0
     if coco_results:
         coco_dt   = coco_gt.loadRes(coco_results)
@@ -356,8 +399,8 @@ def evaluate(model, loader, device, datadir=None):
         map50_95 = float(coco_eval.stats[0])
         map50    = float(coco_eval.stats[1])
     else:
-        print("Warning: no detections above conf_thres=0.01 — mAP is 0.")
-    return map50, map50_95
+        print("Warning: no detections above conf_thres=0.001 — mAP is 0.")
+    return map50, map50_95, mean_iou
 
 
 # ── Datasets (inlined — identical to yolov3 version) ─────────────────────────
@@ -530,7 +573,8 @@ def main(args):
         t_loss, box_l, cls_l, dfl_l = train_one_epoch(
             model, criterion, train_loader, optimizer, device,
             epoch=epoch, debug_grads=args.debug_grads, debug_every=args.debug_every)
-        map50, map50_95 = evaluate(model, val_loader, device, datadir=args.datadir)
+        map50, map50_95, mean_iou = evaluate(model, val_loader, device, datadir=args.datadir)
+        val_loss = _compute_val_loss(model, val_loader, criterion, device, n_batches=50)
         scheduler.step()
 
         train_losses.append(t_loss)
@@ -538,18 +582,19 @@ def main(args):
         current_lr = optimizer.param_groups[0]["lr"]
 
         print(f"Epoch {epoch+1:02d}/{args.epochs} | LR {current_lr:.2e} | "
-              f"Loss {t_loss:.3f}  box {box_l:.3f}  cls {cls_l:.3f}  dfl {dfl_l:.3f} | "
-              f"mAP@0.5 {map50:.4f}  mAP@0.5:0.95 {map50_95:.4f}")
+              f"Train {t_loss:.3f} (box {box_l:.3f} cls {cls_l:.3f} dfl {dfl_l:.3f}) | "
+              f"Val loss {val_loss:.3f} | "
+              f"mAP@0.5 {map50:.4f}  mAP@0.5:0.95 {map50_95:.4f} | MeanIoU {mean_iou:.4f}")
 
         torch.save({"epoch": epoch+1, "model_state_dict": model.state_dict(),
-                    "map50": map50, "map50_95": map50_95},
+                    "map50": map50, "map50_95": map50_95, "val_loss": val_loss, "mean_iou": mean_iou},
                    os.path.join(args.checkpoint_dir, "dinov8_coco_latest.pth"))
 
         if map50 > best_map50 + 1e-4:
             best_map50 = map50
             no_improve  = 0
             torch.save({"epoch": epoch+1, "model_state_dict": model.state_dict(),
-                        "map50": map50, "map50_95": map50_95},
+                        "map50": map50, "map50_95": map50_95, "val_loss": val_loss, "mean_iou": mean_iou},
                        os.path.join(args.checkpoint_dir, "dinov8_coco_best.pth"))
             print(f"  Best mAP@0.5: {best_map50:.4f} saved.")
         elif epoch >= burn_in:

@@ -43,7 +43,7 @@ except ImportError:
     COCO_OK = False
 
 try:
-    from torchvision.ops import batched_nms
+    from torchvision.ops import batched_nms, box_iou
     NMS_OK = True
 except ImportError:
     NMS_OK = False
@@ -123,6 +123,57 @@ def train_one_epoch(
 
 
 # =============================================================================
+# 1b. VALIDATION LOSS  (train-mode subset pass — avoids full epoch overhead)
+# =============================================================================
+
+def _compute_val_loss(
+    model:     DinoPrunableDetector,
+    loader:    DataLoader,
+    criterion,
+    device:    torch.device,
+    n_batches: int = 50,
+) -> float:
+    """
+    Estimate validation loss by running the Detect head in train mode over the
+    first ``n_batches`` batches of *loader*.
+
+    Why train mode?  v8DetectionLoss needs the raw pre-decode feature tensors
+    returned by the Detect head.  In eval mode the head returns decoded boxes.
+
+    BN corruption guard: all BatchNorm layers are pinned to eval mode so their
+    running statistics are not updated during this pass.
+
+    Returns:
+        Average total loss over the sampled batches, or 0.0 if loader is empty.
+    """
+    model.train()
+    # Freeze BN running stats — we don't want val batches shifting them
+    for m in model.modules():
+        if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d)):
+            m.eval()
+
+    total = 0.0
+    count = 0
+
+    with torch.no_grad():
+        for i, batch in enumerate(loader):
+            if i >= n_batches:
+                break
+            imgs, targets = batch
+            imgs = imgs.to(device, non_blocking=True)
+
+            feat  = model.extract_features(imgs).detach()
+            preds = model.head([feat])
+            batch_dict = _build_batch_dict(targets, device)
+            loss_raw, _ = criterion(preds, batch_dict)
+            total += loss_raw.sum().item()
+            count += 1
+
+    model.eval()
+    return total / count if count > 0 else 0.0
+
+
+# =============================================================================
 # 2.  DECODE + NMS
 # =============================================================================
 
@@ -198,21 +249,25 @@ def evaluate_v2(
     loader:  DataLoader,
     device:  torch.device,
     datadir: str | None = None,
-) -> tuple[float, float]:
+) -> tuple[float, float, float]:
     """
-    Official COCOeval mAP on the val split.
+    Official COCOeval mAP + Mean IoU on the val split.
 
     Boxes from the Detect head are in 518-px space (xyxy).  We scale them
     back to original image coordinates before adding to coco_results so that
     COCOeval compares in the correct coordinate system.
 
+    Mean IoU: for each GT box, the max IoU with any predicted box is computed
+    (in 518-px space); these are averaged over all GT instances in the split.
+    Images with no predictions contribute 0 IoU for each of their GT boxes.
+
     Returns:
-        (mAP@0.5,  mAP@0.5:0.95)
-        Both are 0.0 if pycocotools is unavailable or no detections are made.
+        (mAP@0.5,  mAP@0.5:0.95,  mean_iou)
+        All 0.0 if pycocotools is unavailable or no detections are made.
     """
     if not COCO_OK:
         print("pycocotools not found — mAP skipped.")
-        return 0.0, 0.0
+        return 0.0, 0.0, 0.0
 
     model.eval()
     coco_results: list[dict] = []
@@ -226,6 +281,10 @@ def evaluate_v2(
         else:
             print(f"Annotation file not found at {ann_file} — mAP skipped.")
 
+    # Mean IoU accumulators (computed in 518-px space)
+    iou_sum:   float = 0.0
+    iou_count: int   = 0
+
     with torch.no_grad():
         for batch in tqdm(loader, desc="Eval", leave=False):
             imgs, targets = batch
@@ -233,12 +292,33 @@ def evaluate_v2(
 
             with torch.autocast(device_type=device.type, dtype=torch.float16):
                 out  = model(imgs)                       # eval: (y, x_dict)
-            dets = decode_v8_output(out, conf_thres=0.01, iou_thres=0.45, max_det=300)
-
-            if coco_gt is None:
-                continue
+            # Lower threshold → denser recall → more accurate COCOeval PR curve.
+            # COCOeval sweeps its own thresholds so submitting more detections
+            # (with low score) only helps; the extra FPs are penalised by the
+            # precision side of the curve.
+            dets = decode_v8_output(out, conf_thres=0.001, iou_thres=0.45, max_det=300)
 
             for det, tgt in zip(dets, targets):
+                # ── Mean IoU ────────────────────────────────────────────────
+                # GT boxes are stored normalised [0,1] xyxy; scale to 518-px.
+                gt_norm = tgt["boxes"]                              # (G, 4)
+                if gt_norm.shape[0] > 0:
+                    gt_px = gt_norm.clone()
+                    gt_px[:, [0, 2]] *= IMG_SIZE
+                    gt_px[:, [1, 3]] *= IMG_SIZE
+                    gt_px = gt_px.to(device)
+
+                    if det.shape[0] > 0 and NMS_OK:
+                        iou_mat = box_iou(gt_px, det[:, :4])       # (G, N_pred)
+                        max_iou = iou_mat.max(dim=1).values         # (G,)
+                        iou_sum   += max_iou.sum().item()
+                    # else: no predictions → IoU = 0 for every GT box
+                    iou_count += gt_norm.shape[0]
+
+                # ── COCOeval ─────────────────────────────────────────────────
+                if coco_gt is None:
+                    continue
+
                 img_id   = tgt["image_id"]
                 img_info = coco_gt.imgs[img_id]
 
@@ -260,12 +340,16 @@ def evaluate_v2(
                         "score": score,
                     })
 
+    mean_iou = iou_sum / iou_count if iou_count > 0 else 0.0
+
     if not coco_results:
-        print("Warning: no detections above conf_thres=0.01 — mAP is 0.")
-        return 0.0, 0.0
+        print("Warning: no detections above conf_thres=0.001 — mAP is 0.")
+        model.train()
+        return 0.0, 0.0, mean_iou
 
     if coco_gt is None:
-        return 0.0, 0.0
+        model.train()
+        return 0.0, 0.0, mean_iou
 
     coco_dt   = coco_gt.loadRes(coco_results)
     coco_eval = COCOeval(coco_gt, coco_dt, "bbox")
@@ -277,7 +361,7 @@ def evaluate_v2(
     map50    = float(coco_eval.stats[1])   # IoU=0.50
 
     model.train()   # restore training mode — eval() is never undone otherwise
-    return map50, map50_95
+    return map50, map50_95, mean_iou
 
 
 # =============================================================================
@@ -386,11 +470,14 @@ def main(args: argparse.Namespace) -> None:
         # and a full 5 k-image val pass at 518×518 is slow).  After burn-in,
         # evaluate every epoch so early stopping can react promptly.
         if epoch >= burn_in or epoch % 5 == 4:
-            map50, map50_95 = evaluate_v2(
+            map50, map50_95, mean_iou = evaluate_v2(
                 model, val_loader, device, datadir=args.datadir
             )
+            val_loss = _compute_val_loss(
+                model, val_loader, criterion, device, n_batches=50
+            )
         else:
-            map50, map50_95 = 0.0, 0.0
+            map50, map50_95, mean_iou, val_loss = 0.0, 0.0, 0.0, 0.0
 
         scheduler.step()
 
@@ -401,8 +488,10 @@ def main(args: argparse.Namespace) -> None:
         print(
             f"Epoch {epoch+1:02d}/{args.epochs} | "
             f"LR {current_lr:.2e} | "
-            f"Loss {t_loss:.3f}  box {box_l:.3f}  cls {cls_l:.3f}  dfl {dfl_l:.3f} | "
-            f"mAP@0.5 {map50:.4f}  mAP@0.5:0.95 {map50_95:.4f}"
+            f"Train {t_loss:.3f} (box {box_l:.3f} cls {cls_l:.3f} dfl {dfl_l:.3f}) | "
+            f"Val loss {val_loss:.3f} | "
+            f"mAP@0.5 {map50:.4f}  mAP@0.5:0.95 {map50_95:.4f} | "
+            f"MeanIoU {mean_iou:.4f}"
         )
 
         # Save latest checkpoint — includes optimizer/scheduler so resume works
@@ -416,6 +505,8 @@ def main(args: argparse.Namespace) -> None:
             "no_improve":         no_improve,
             "map50":              map50,
             "map50_95":           map50_95,
+            "val_loss":           val_loss,
+            "mean_iou":           mean_iou,
         }
         torch.save(ckpt, os.path.join(args.checkpoint_dir, "dinov2_coco_latest.pth"))
 

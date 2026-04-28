@@ -10,7 +10,7 @@ import torchvision.transforms as T
 import matplotlib.pyplot as plt
 
 from torch.utils.data import Dataset, DataLoader
-from torchvision.ops import nms
+from torchvision.ops import nms, box_iou
 from tqdm.auto import tqdm
 from PIL import Image
 
@@ -406,7 +406,7 @@ def train_one_epoch(model, loader, optimizer, device):
 
 def evaluate(model, loader, device, datadir=None):
     if not COCO_EVAL_AVAILABLE:
-        return 0.0, 0.0, 0.0
+        return 0.0, 0.0, 0.0, 0.0
 
     model.eval()
     running_loss = 0.0
@@ -424,31 +424,48 @@ def evaluate(model, loader, device, datadir=None):
         if coco_gt is None:
             print(f"Warning: annotation file not found at {ann_file}. mAP skipped.")
 
+    iou_sum:   float = 0.0
+    iou_count: int   = 0
+
     with torch.no_grad():
         for batch, targets in tqdm(loader, desc="Evaluating", leave=False):
             batch = batch.to(device)
             preds = model(batch)
             running_loss += yolo_loss(preds, targets, model.anchors, device).item()
 
-            if coco_gt is not None:
-                # Low threshold: COCOeval sweeps confidence to build the full PR curve
-                dets = decode_predictions(preds, model.anchors, conf_thresh=0.01)
-                for det, tgt in zip(dets, targets):
-                    img_id   = tgt["image_id"]
-                    img_info = coco_gt.imgs[img_id]
-                    sx = img_info["width"]  / IMG_SIZE   # convert 224px → original pixel space
-                    sy = img_info["height"] / IMG_SIZE
-                    for k in range(len(det["scores"])):
-                        box = det["boxes"][k]
-                        coco_results.append({
-                            "image_id":    img_id,
-                            "category_id": IDX_TO_CAT[det["labels"][k].item()],
-                            "bbox": [box[0].item()*sx, box[1].item()*sy,
-                                     (box[2]-box[0]).item()*sx, (box[3]-box[1]).item()*sy],
-                            "score": det["scores"][k].item(),
-                        })
+            # Lower threshold — COCOeval sweeps its own thresholds; more candidates = better PR curve
+            dets = decode_predictions(preds, model.anchors, conf_thresh=0.001)
+            for det, tgt in zip(dets, targets):
+                # ── Mean IoU ────────────────────────────────────────────────────
+                gt_norm = tgt["boxes"]                              # (G, 4) normalised xyxy
+                if gt_norm.shape[0] > 0:
+                    gt_px = gt_norm * IMG_SIZE                      # scale to 224-px space
+                    gt_px = gt_px.to(device)
+                    pred_boxes = det["boxes"].to(device)            # (N, 4) 224-px xyxy
+                    if pred_boxes.shape[0] > 0:
+                        iou_mat = box_iou(gt_px, pred_boxes)        # (G, N)
+                        iou_sum += iou_mat.max(dim=1).values.sum().item()
+                    iou_count += gt_norm.shape[0]
+
+                # ── COCOeval ─────────────────────────────────────────────────
+                if coco_gt is None:
+                    continue
+                img_id   = tgt["image_id"]
+                img_info = coco_gt.imgs[img_id]
+                sx = img_info["width"]  / IMG_SIZE
+                sy = img_info["height"] / IMG_SIZE
+                for k in range(len(det["scores"])):
+                    box = det["boxes"][k]
+                    coco_results.append({
+                        "image_id":    img_id,
+                        "category_id": IDX_TO_CAT[det["labels"][k].item()],
+                        "bbox": [box[0].item()*sx, box[1].item()*sy,
+                                 (box[2]-box[0]).item()*sx, (box[3]-box[1]).item()*sy],
+                        "score": det["scores"][k].item(),
+                    })
 
     avg_loss        = running_loss / len(loader)
+    mean_iou        = iou_sum / iou_count if iou_count > 0 else 0.0
     map50, map50_95 = 0.0, 0.0
     if coco_gt is not None and coco_results:
         coco_dt   = coco_gt.loadRes(coco_results)
@@ -457,8 +474,8 @@ def evaluate(model, loader, device, datadir=None):
         map50_95 = float(coco_eval.stats[0])
         map50    = float(coco_eval.stats[1])
     elif not coco_results:
-        print("Warning: no detections above threshold — mAP is 0.")
-    return avg_loss, map50, map50_95
+        print("Warning: no detections above conf_thresh=0.001 — mAP is 0.")
+    return avg_loss, map50, map50_95, mean_iou
 
 
 # ── DetectionValidator (RL agent) ─────────────────────────────────────────────
@@ -561,7 +578,7 @@ def main(args):
 
     for epoch in range(args.epochs):
         t_loss               = train_one_epoch(model, train_loader, optimizer, device)
-        v_loss, map50, map50_95 = evaluate(model, val_loader, device, datadir=args.datadir)
+        v_loss, map50, map50_95, mean_iou = evaluate(model, val_loader, device, datadir=args.datadir)
         scheduler.step()
 
         train_losses.append(t_loss)
@@ -569,10 +586,10 @@ def main(args):
         map50_list.append(map50)
 
         print(f"Epoch {epoch+1}/{args.epochs} | Train {t_loss:.4f} | Val {v_loss:.4f} | "
-              f"mAP@0.5 {map50:.4f} | mAP@0.5:0.95 {map50_95:.4f}")
+              f"mAP@0.5 {map50:.4f} | mAP@0.5:0.95 {map50_95:.4f} | MeanIoU {mean_iou:.4f}")
 
         torch.save({"epoch": epoch+1, "model_state_dict": model.state_dict(),
-                    "map50": map50, "map50_95": map50_95},
+                    "map50": map50, "map50_95": map50_95, "val_loss": v_loss, "mean_iou": mean_iou},
                    os.path.join(args.checkpoint_dir, "dino_coco_latest.pth"))
 
         # Early stop on val loss — mAP is ~0 for first ~15 epochs
@@ -581,7 +598,7 @@ def main(args):
             no_improve    = 0
             best_map50    = max(best_map50, map50)
             torch.save({"epoch": epoch+1, "model_state_dict": model.state_dict(),
-                        "map50": map50, "map50_95": map50_95},
+                        "map50": map50, "map50_95": map50_95, "val_loss": v_loss, "mean_iou": mean_iou},
                        os.path.join(args.checkpoint_dir, "dino_coco_best.pth"))
             print(f"  Best val loss {best_val_loss:.4f} | mAP@0.5 {best_map50:.4f} saved.")
         else:
