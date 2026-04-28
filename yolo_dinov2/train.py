@@ -26,6 +26,7 @@ import argparse
 
 import torch
 import torch.nn as nn
+import torch.cuda.amp as amp
 import matplotlib.pyplot as plt
 
 from torch.utils.data import DataLoader
@@ -58,6 +59,7 @@ def train_one_epoch(
     loader:    DataLoader,
     optimizer: torch.optim.Optimizer,
     device:    torch.device,
+    scaler:    amp.GradScaler | None = None,
 ) -> tuple[float, float, float, float]:
     """
     One training epoch over raw COCO images.
@@ -71,29 +73,43 @@ def train_one_epoch(
 
     for batch in tqdm(loader, desc="Train", leave=False):
         imgs, targets = batch
-        imgs = imgs.to(device)                               # (B, 3, 518, 518)
+        # non_blocking=True overlaps H→D transfer with previous GPU work
+        # (only effective because pin_memory=True is set in the DataLoader).
+        imgs = imgs.to(device, non_blocking=True)            # (B, 3, 518, 518)
 
         # Backbone is frozen — run it without autograd to save memory and time.
+        # AMP is applied to the whole forward (backbone + head) because the
+        # backbone runs under no_grad anyway; autocast just enables TF32/FP16
+        # for the frozen backbone's matmuls which are the main compute cost.
         # head([feat]) below still builds a graph through the head parameters.
         with torch.no_grad():
-            feat = model.extract_features(imgs)              # (B, 768, 37, 37)
+            with torch.autocast(device_type=device.type, dtype=torch.float16,
+                                enabled=(scaler is not None)):
+                feat = model.extract_features(imgs)          # (B, 768, 37, 37)
         feat = feat.detach()
-        preds = model.head([feat])                           # training: list of tensors
 
-        batch_dict = _build_batch_dict(targets, device)
-        loss_raw, items = criterion(preds, batch_dict)
+        with torch.autocast(device_type=device.type, dtype=torch.float16,
+                            enabled=(scaler is not None)):
+            preds = model.head([feat])                       # training: list of tensors
+
+            batch_dict = _build_batch_dict(targets, device)
+            loss_raw, items = criterion(preds, batch_dict)
 
         # v8DetectionLoss may return a scalar or a 3-element vector depending
         # on the ultralytics version.  Always reduce to scalar before backward.
         loss: torch.Tensor = loss_raw.sum()
 
         optimizer.zero_grad()
-        loss.backward()
-        nn.utils.clip_grad_norm_(
-            list(model.head.parameters()),
-            max_norm=10.0,
-        )
-        optimizer.step()
+        if scaler is not None:
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            nn.utils.clip_grad_norm_(list(model.head.parameters()), max_norm=10.0)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            nn.utils.clip_grad_norm_(list(model.head.parameters()), max_norm=10.0)
+            optimizer.step()
 
         totals[0] += loss.item()
         totals[1:] += items.detach().cpu()[:3]
@@ -213,9 +229,10 @@ def evaluate_v2(
     with torch.no_grad():
         for batch in tqdm(loader, desc="Eval", leave=False):
             imgs, targets = batch
-            imgs = imgs.to(device)
+            imgs = imgs.to(device, non_blocking=True)
 
-            out  = model(imgs)                           # eval: (y, x_dict)
+            with torch.autocast(device_type=device.type, dtype=torch.float16):
+                out  = model(imgs)                       # eval: (y, x_dict)
             dets = decode_v8_output(out, conf_thres=0.01, iou_thres=0.45, max_det=300)
 
             if coco_gt is None:
@@ -259,6 +276,7 @@ def evaluate_v2(
     map50_95 = float(coco_eval.stats[0])   # IoU=0.50:0.95
     map50    = float(coco_eval.stats[1])   # IoU=0.50
 
+    model.train()   # restore training mode — eval() is never undone otherwise
     return map50, map50_95
 
 
@@ -274,17 +292,24 @@ def main(args: argparse.Namespace) -> None:
     )
     print(f"Device: {device}")
 
+    # Let cuDNN auto-tune convolution algorithms for this fixed input shape.
+    # All convolutions in the Detect head receive (B, 768, 37, 37) every batch,
+    # so the one-time benchmark pays for itself within the first few batches.
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+
     # ── Model ─────────────────────────────────────────────────────────────────
     model = DinoPrunableDetector(device=device).to(device)
     # head.stride is not a buffer in ultralytics Detect — move manually
     model.head.stride = model.head.stride.to(device)
 
-    # ── Resume from checkpoint ────────────────────────────────────────────────
     os.makedirs(args.checkpoint_dir, exist_ok=True)
+    # Load checkpoint weights early so model params are correct before optimizer init
+    _resume_ckpt = None
     if args.checkpoint and os.path.exists(args.checkpoint):
-        ckpt = torch.load(args.checkpoint, map_location=device)
-        model.load_state_dict(ckpt["model_state_dict"])
-        print(f"Resumed from: {args.checkpoint}")
+        _resume_ckpt = torch.load(args.checkpoint, map_location=device)
+        model.load_state_dict(_resume_ckpt["model_state_dict"])
+        print(f"Resumed model weights from: {args.checkpoint}")
 
     # ── Data ──────────────────────────────────────────────────────────────────
     train_loader, val_loader = get_coco_loaders_v2(
@@ -323,25 +348,50 @@ def main(args: argparse.Namespace) -> None:
 
     criterion = build_criterion(model.head, device)
 
+    # AMP GradScaler — enabled only on CUDA (not MPS or CPU).
+    # The scaler is passed into train_one_epoch; eval runs under autocast without
+    # a scaler because no backward pass occurs there.
+    use_amp = (device.type == "cuda")
+    scaler  = amp.GradScaler(enabled=use_amp)
+
     # ── Training state ────────────────────────────────────────────────────────
     train_losses: list[float] = []
     map50_list:   list[float] = []
 
-    # Early stopping burn-in: mAP is ~0 for the first 15–20 epochs because the
-    # head has not yet calibrated confidence scores.  Only start counting
-    # patience after the burn-in period ends.
     burn_in    = max(warmup_epochs, 15)
     best_map50 = 0.0
     no_improve = 0
+    start_epoch = 0
+
+    # Restore optimizer / scheduler / early-stopping state from checkpoint
+    if _resume_ckpt is not None:
+        if "optimizer_state" in _resume_ckpt:
+            optimizer.load_state_dict(_resume_ckpt["optimizer_state"])
+        if "scheduler_state" in _resume_ckpt:
+            scheduler.load_state_dict(_resume_ckpt["scheduler_state"])
+        if "scaler_state" in _resume_ckpt and use_amp:
+            scaler.load_state_dict(_resume_ckpt["scaler_state"])
+        best_map50  = _resume_ckpt.get("best_map50",  0.0)
+        no_improve  = _resume_ckpt.get("no_improve",  0)
+        start_epoch = _resume_ckpt.get("epoch",       0)
+        print(f"Resumed training state: epoch={start_epoch}, best_mAP={best_map50:.4f}")
 
     # ── Epoch loop ────────────────────────────────────────────────────────────
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         t_loss, box_l, cls_l, dfl_l = train_one_epoch(
-            model, criterion, train_loader, optimizer, device
+            model, criterion, train_loader, optimizer, device, scaler=scaler
         )
-        map50, map50_95 = evaluate_v2(
-            model, val_loader, device, datadir=args.datadir
-        )
+
+        # Evaluate every 5 epochs during the burn-in period (mAP is ~0 anyway
+        # and a full 5 k-image val pass at 518×518 is slow).  After burn-in,
+        # evaluate every epoch so early stopping can react promptly.
+        if epoch >= burn_in or epoch % 5 == 4:
+            map50, map50_95 = evaluate_v2(
+                model, val_loader, device, datadir=args.datadir
+            )
+        else:
+            map50, map50_95 = 0.0, 0.0
+
         scheduler.step()
 
         train_losses.append(t_loss)
@@ -355,30 +405,26 @@ def main(args: argparse.Namespace) -> None:
             f"mAP@0.5 {map50:.4f}  mAP@0.5:0.95 {map50_95:.4f}"
         )
 
-        # Save latest checkpoint
-        torch.save(
-            {
-                "epoch":            epoch + 1,
-                "model_state_dict": model.state_dict(),
-                "map50":            map50,
-                "map50_95":         map50_95,
-            },
-            os.path.join(args.checkpoint_dir, "dinov2_coco_latest.pth"),
-        )
+        # Save latest checkpoint — includes optimizer/scheduler so resume works
+        ckpt = {
+            "epoch":              epoch + 1,
+            "model_state_dict":   model.state_dict(),
+            "optimizer_state":    optimizer.state_dict(),
+            "scheduler_state":    scheduler.state_dict(),
+            "scaler_state":       scaler.state_dict(),
+            "best_map50":         best_map50,
+            "no_improve":         no_improve,
+            "map50":              map50,
+            "map50_95":           map50_95,
+        }
+        torch.save(ckpt, os.path.join(args.checkpoint_dir, "dinov2_coco_latest.pth"))
 
         # Save best checkpoint and update patience counter
         if map50 > best_map50 + 1e-4:
             best_map50 = map50
             no_improve  = 0
-            torch.save(
-                {
-                    "epoch":            epoch + 1,
-                    "model_state_dict": model.state_dict(),
-                    "map50":            map50,
-                    "map50_95":         map50_95,
-                },
-                os.path.join(args.checkpoint_dir, "dinov2_coco_best.pth"),
-            )
+            ckpt["best_map50"] = best_map50
+            torch.save(ckpt, os.path.join(args.checkpoint_dir, "dinov2_coco_best.pth"))
             print(f"  Best mAP@0.5: {best_map50:.4f} saved.")
         elif epoch >= burn_in:
             # Only increment patience counter once the burn-in period has ended

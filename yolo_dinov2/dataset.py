@@ -79,8 +79,11 @@ class COCODetectionDatasetV2(Dataset):
         self.img_ids = sorted(self.coco.imgs.keys())
         self.augment = augment
 
-        # Resize to DINOv2 native resolution; ToTensor converts to [0, 1]
-        self._resize = T.Resize((IMG_SIZE, IMG_SIZE))
+        # Resize to DINOv2 native resolution; ToTensor converts to [0, 1].
+        # Both are instantiated once here rather than inside __getitem__ so that
+        # no Python object construction overhead occurs per sample.
+        self._resize    = T.Resize((IMG_SIZE, IMG_SIZE))
+        self._to_tensor = T.ToTensor()
 
     def __len__(self) -> int:
         return len(self.img_ids)
@@ -96,7 +99,7 @@ class COCODetectionDatasetV2(Dataset):
         orig_w, orig_h = img.size
 
         img = self._resize(img)                      # PIL resize → (IMG_SIZE, IMG_SIZE)
-        img_tensor: Tensor = T.ToTensor()(img)       # (3, H, W) float32 in [0, 1]
+        img_tensor: Tensor = self._to_tensor(img)    # (3, H, W) float32 in [0, 1]
 
         # ── Load annotations ──────────────────────────────────────────────────
         ann_ids = self.coco.getAnnIds(imgIds=img_id, iscrowd=False)
@@ -198,6 +201,16 @@ def get_coco_loaders_v2(
     train_set = COCODetectionDatasetV2(datadir, split="train", augment=True)
     val_set   = COCODetectionDatasetV2(datadir, split="val",   augment=False)
 
+    # persistent_workers=True keeps worker processes alive between epochs,
+    # eliminating the ~5-10 s fork/import overhead at the start of each epoch.
+    # prefetch_factor=4 keeps 4 batches queued per worker so the GPU never
+    # waits for I/O.  Only set these when workers > 0 (avoids a PyTorch warning
+    # when num_workers=0 / debugging).
+    extra_kw = (
+        dict(persistent_workers=True, prefetch_factor=4)
+        if num_workers > 0 else {}
+    )
+
     train_loader = DataLoader(
         train_set,
         batch_size=batch_size,
@@ -205,6 +218,7 @@ def get_coco_loaders_v2(
         num_workers=num_workers,
         pin_memory=True,
         collate_fn=collate_fn_v2,
+        **extra_kw,
     )
     val_loader = DataLoader(
         val_set,
@@ -213,5 +227,6 @@ def get_coco_loaders_v2(
         num_workers=num_workers,
         pin_memory=True,
         collate_fn=collate_fn_v2,
+        **extra_kw,
     )
     return train_loader, val_loader

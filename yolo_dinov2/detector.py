@@ -344,7 +344,7 @@ class DinoPrunableDetector(nn.Module):
             loss_raw, _ = criterion(preds, batch_dict)
             loss = loss_raw.sum()
 
-            self.zero_grad()
+            self.zero_grad()   # zero BEFORE backward so no stale .grad accumulation
             loss.backward()
 
         if not was_training:

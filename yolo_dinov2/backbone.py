@@ -100,11 +100,20 @@ class DinoPrunableBackbone(nn.Module):
         self.hooks = []
 
         def _make_hook(layer_idx: int):
+            # Pre-compute the 768-dim mask once at hook-registration time.
+            # This avoids repeat_interleave + .to() on every single forward call
+            # (12 blocks × every batch = thousands of redundant Python ops/epoch).
+            # When set_mask() is called it removes and re-registers all hooks, so
+            # the pre-computed tensor is always consistent with self.mask.
+            full_mask: torch.Tensor = (
+                self.mask[layer_idx]
+                .repeat_interleave(self.HEAD_DIM)   # (768,)
+                .to(next(self.vit.parameters()).device)
+            )
+
             def pre_hook(module: nn.Module, inp: tuple) -> tuple:
                 # inp[0]: (B, N, 768) — concatenated head outputs
-                mask_row: torch.Tensor = self.mask[layer_idx]       # (12,)
-                full_mask = mask_row.repeat_interleave(self.HEAD_DIM)  # (768,)
-                return (inp[0] * full_mask.to(inp[0].device),)
+                return (inp[0] * full_mask,)
             return pre_hook
 
         for i in range(self.NUM_LAYERS):
@@ -122,7 +131,11 @@ class DinoPrunableBackbone(nn.Module):
             Shape (144,) — flat binary (or soft) mask provided by the RL agent.
             Reshaped internally to (NUM_LAYERS, NUM_HEADS) = (12, 12).
         """
-        self.mask = mask_1d.view(self.NUM_LAYERS, self.NUM_HEADS)
+        # Keep mask on the same device as the existing self.mask buffer so hooks
+        # don't have to call .to() on every forward pass (the hook still does
+        # full_mask.to(inp[0].device) as a safety net, but self.mask should stay
+        # on the right device from the start).
+        self.mask = mask_1d.view(self.NUM_LAYERS, self.NUM_HEADS).to(self.mask.device)
         self._register_pruning_hooks()
 
     # ── Image normalisation ───────────────────────────────────────────────────
