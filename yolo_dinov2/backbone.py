@@ -100,20 +100,24 @@ class DinoPrunableBackbone(nn.Module):
         self.hooks = []
 
         def _make_hook(layer_idx: int):
-            # Pre-compute the 768-dim mask once at hook-registration time.
-            # This avoids repeat_interleave + .to() on every single forward call
-            # (12 blocks × every batch = thousands of redundant Python ops/epoch).
-            # When set_mask() is called it removes and re-registers all hooks, so
-            # the pre-computed tensor is always consistent with self.mask.
-            full_mask: torch.Tensor = (
-                self.mask[layer_idx]
-                .repeat_interleave(self.HEAD_DIM)   # (768,)
-                .to(next(self.vit.parameters()).device)
-            )
+            # Lazily compute the 768-dim mask on first use and cache it per
+            # device.  We cannot pre-compute at registration time because the
+            # model may not have been moved to its final device yet (hooks are
+            # registered in __init__ while weights are still on CPU; model.to()
+            # moves parameters but does not update closure-captured tensors).
+            # set_mask() always calls _register_pruning_hooks(), which creates
+            # fresh closures with an empty cache, so stale masks are impossible.
+            _cache: dict = {}
 
             def pre_hook(module: nn.Module, inp: tuple) -> tuple:
-                # inp[0]: (B, N, 768) — concatenated head outputs
-                return (inp[0] * full_mask,)
+                dev = inp[0].device
+                if dev not in _cache:
+                    _cache[dev] = (
+                        self.mask[layer_idx]
+                        .repeat_interleave(self.HEAD_DIM)   # (768,)
+                        .to(dev)
+                    )
+                return (inp[0] * _cache[dev],)
             return pre_hook
 
         for i in range(self.NUM_LAYERS):
