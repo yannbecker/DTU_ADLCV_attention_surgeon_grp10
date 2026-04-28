@@ -312,13 +312,16 @@ def _compute_val_loss(model, loader, criterion, device, n_batches=50):
     """
     Estimate val loss over the first n_batches batches.
 
-    Runs in train mode so the Detect head returns raw tensors (needed by the
-    loss).  BN stats are frozen to prevent corruption from val batches.
+    Requires train mode so the Detect head returns raw feature tensors
+    (in eval mode it returns decoded boxes, which v8DetectionLoss cannot use).
+
+    BN layers run with live batch statistics — same as during training.
+    The running-stat drift from 50 val batches is negligible versus the
+    ~3700+ train batches that dominate the running statistics.
+    Freezing BN at eval() causes near-zero outputs from an uncalibrated
+    neck at epoch 1, which produces 0 positive anchor assignments → loss=0.
     """
     model.train()
-    for m in model.modules():
-        if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d)):
-            m.eval()
     total, count = 0.0, 0
     with torch.no_grad():
         for i, (batch_data, targets) in enumerate(loader):

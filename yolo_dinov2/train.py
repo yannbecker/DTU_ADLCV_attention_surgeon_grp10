@@ -147,10 +147,10 @@ def _compute_val_loss(
         Average total loss over the sampled batches, or 0.0 if loader is empty.
     """
     model.train()
-    # Freeze BN running stats — we don't want val batches shifting them
-    for m in model.modules():
-        if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d)):
-            m.eval()
+    # BN runs with live batch stats — same as during training.
+    # Freezing BN at eval() leaves it uncalibrated at epoch 1, which causes
+    # degenerate neck outputs → 0 IoU → 0 positive assignments → loss = 0.
+    # The running-stat drift from n_batches val samples per epoch is negligible.
 
     total = 0.0
     count = 0
