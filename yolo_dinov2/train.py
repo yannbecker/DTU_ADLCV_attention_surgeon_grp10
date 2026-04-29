@@ -282,8 +282,9 @@ def evaluate_v2(
             print(f"Annotation file not found at {ann_file} — mAP skipped.")
 
     # Mean IoU accumulators (computed in 518-px space)
-    iou_sum:   float = 0.0
-    iou_count: int   = 0
+    iou_sum:      float = 0.0
+    iou_count:    int   = 0
+    recall01_num: int   = 0   # GT boxes with any pred IoU >= 0.1
 
     with torch.no_grad():
         for batch in tqdm(loader, desc="Eval", leave=False):
@@ -311,7 +312,8 @@ def evaluate_v2(
                     if det.shape[0] > 0 and NMS_OK:
                         iou_mat = box_iou(gt_px, det[:, :4])       # (G, N_pred)
                         max_iou = iou_mat.max(dim=1).values         # (G,)
-                        iou_sum   += max_iou.sum().item()
+                        iou_sum      += max_iou.sum().item()
+                        recall01_num += int((max_iou >= 0.1).sum().item())
                     # else: no predictions → IoU = 0 for every GT box
                     iou_count += gt_norm.shape[0]
 
@@ -340,16 +342,30 @@ def evaluate_v2(
                         "score": score,
                     })
 
-    mean_iou = iou_sum / iou_count if iou_count > 0 else 0.0
+    mean_iou  = iou_sum / iou_count if iou_count > 0 else 0.0
+    recall01  = recall01_num / iou_count if iou_count > 0 else 0.0
+
+    # Diagnostic: how many predictions are we actually submitting?
+    avg_preds_per_img = len(coco_results) / max(1, len(loader.dataset))
+    avg_conf = (
+        sum(r["score"] for r in coco_results) / len(coco_results)
+        if coco_results else 0.0
+    )
+    print(
+        f"  [eval] coco_results={len(coco_results)}  "
+        f"avg_preds/img={avg_preds_per_img:.1f}  "
+        f"avg_conf={avg_conf:.4f}  "
+        f"recall@IoU>=0.1={recall01:.4f}"
+    )
 
     if not coco_results:
         print("Warning: no detections above conf_thres=0.001 — mAP is 0.")
         model.train()
-        return 0.0, 0.0, mean_iou
+        return 0.0, 0.0, mean_iou, recall01
 
     if coco_gt is None:
         model.train()
-        return 0.0, 0.0, mean_iou
+        return 0.0, 0.0, mean_iou, recall01
 
     coco_dt   = coco_gt.loadRes(coco_results)
     coco_eval = COCOeval(coco_gt, coco_dt, "bbox")
@@ -361,7 +377,7 @@ def evaluate_v2(
     map50    = float(coco_eval.stats[1])   # IoU=0.50
 
     model.train()   # restore training mode — eval() is never undone otherwise
-    return map50, map50_95, mean_iou
+    return map50, map50_95, mean_iou, recall01
 
 
 # =============================================================================
@@ -470,14 +486,14 @@ def main(args: argparse.Namespace) -> None:
         # and a full 5 k-image val pass at 518×518 is slow).  After burn-in,
         # evaluate every epoch so early stopping can react promptly.
         if epoch >= burn_in or epoch % 5 == 4:
-            map50, map50_95, mean_iou = evaluate_v2(
+            map50, map50_95, mean_iou, recall01 = evaluate_v2(
                 model, val_loader, device, datadir=args.datadir
             )
             val_loss = _compute_val_loss(
                 model, val_loader, criterion, device, n_batches=50
             )
         else:
-            map50, map50_95, mean_iou, val_loss = 0.0, 0.0, 0.0, 0.0
+            map50, map50_95, mean_iou, recall01, val_loss = 0.0, 0.0, 0.0, 0.0, 0.0
 
         scheduler.step()
 
@@ -491,7 +507,7 @@ def main(args: argparse.Namespace) -> None:
             f"Train {t_loss:.3f} (box {box_l:.3f} cls {cls_l:.3f} dfl {dfl_l:.3f}) | "
             f"Val loss {val_loss:.3f} | "
             f"mAP@0.5 {map50:.4f}  mAP@0.5:0.95 {map50_95:.4f} | "
-            f"MeanIoU {mean_iou:.4f}"
+            f"MeanIoU {mean_iou:.4f}  recall@0.1 {recall01:.4f}"
         )
 
         # Save latest checkpoint — includes optimizer/scheduler so resume works

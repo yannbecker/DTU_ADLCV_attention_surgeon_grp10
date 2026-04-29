@@ -98,9 +98,6 @@ class COCODetectionDatasetV2(Dataset):
         ).convert("RGB")
         orig_w, orig_h = img.size
 
-        img = self._resize(img)                      # PIL resize → (IMG_SIZE, IMG_SIZE)
-        img_tensor: Tensor = self._to_tensor(img)    # (3, H, W) float32 in [0, 1]
-
         # ── Load annotations ──────────────────────────────────────────────────
         ann_ids = self.coco.getAnnIds(imgIds=img_id, iscrowd=False)
         anns    = self.coco.loadAnns(ann_ids)
@@ -148,17 +145,67 @@ class COCODetectionDatasetV2(Dataset):
             "image_id": img_id,
         }
 
-        # ── Augmentation: random horizontal flip (training only) ──────────────
-        if self.augment and boxes.numel() > 0 and torch.rand(1).item() < 0.5:
-            img_tensor = img_tensor.flip(-1)                 # flip W dimension
-            new_x1 = 1.0 - boxes[:, 2]
-            new_x2 = 1.0 - boxes[:, 0]
-            boxes   = torch.stack([new_x1, boxes[:, 1], new_x2, boxes[:, 3]], dim=1)
-            target["boxes"] = boxes
-        elif self.augment and boxes.numel() == 0 and torch.rand(1).item() < 0.5:
-            # Flip image even when there are no boxes (keeps pixel statistics consistent)
-            img_tensor = img_tensor.flip(-1)
+        # ── Augmentation (training only) ──────────────────────────────────────
+        if self.augment:
+            # 1. Colour jitter on the PIL image (no bbox changes needed)
+            if torch.rand(1).item() < 0.8:
+                jitter = T.ColorJitter(
+                    brightness=0.4, contrast=0.4, saturation=0.3, hue=0.05
+                )
+                img = jitter(img)
 
+            # 2. Random scale jitter: resize to s×IMG_SIZE, then crop or pad
+            #    so the final tensor is always IMG_SIZE×IMG_SIZE.
+            #    s ∈ [0.6, 1.4] — wide enough to change apparent object size.
+            s = 0.6 + 0.8 * torch.rand(1).item()          # uniform [0.6, 1.4]
+            new_size = int(IMG_SIZE * s)
+            img = img.resize((new_size, new_size), Image.BILINEAR)
+
+            if new_size >= IMG_SIZE:
+                # Random crop down to IMG_SIZE
+                max_offset = new_size - IMG_SIZE
+                x0 = int(torch.randint(0, max_offset + 1, (1,)).item())
+                y0 = int(torch.randint(0, max_offset + 1, (1,)).item())
+                img = img.crop((x0, y0, x0 + IMG_SIZE, y0 + IMG_SIZE))
+                if boxes.numel() > 0:
+                    bpx = boxes * new_size          # [0, new_size] xyxy
+                    bpx[:, [0, 2]] -= x0
+                    bpx[:, [1, 3]] -= y0
+                    bpx = bpx.clamp(0.0, float(IMG_SIZE))
+                    valid = (bpx[:, 2] > bpx[:, 0] + 1) & (bpx[:, 3] > bpx[:, 1] + 1)
+                    boxes  = bpx[valid] / IMG_SIZE
+                    labels = labels[valid]
+            else:
+                # Centre-pad to IMG_SIZE with grey (matches YOLOv8 letterbox convention)
+                px = (IMG_SIZE - new_size) // 2
+                py = (IMG_SIZE - new_size) // 2
+                padded = Image.new("RGB", (IMG_SIZE, IMG_SIZE), (114, 114, 114))
+                padded.paste(img, (px, py))
+                img = padded
+                if boxes.numel() > 0:
+                    bpx = boxes * new_size          # [0, new_size] xyxy
+                    bpx[:, [0, 2]] += px
+                    bpx[:, [1, 3]] += py
+                    boxes = bpx / IMG_SIZE
+
+            img_tensor = self._to_tensor(img)
+
+            # 3. Random horizontal flip
+            if torch.rand(1).item() < 0.5:
+                img_tensor = img_tensor.flip(-1)
+                if boxes.numel() > 0:
+                    new_x1 = 1.0 - boxes[:, 2]
+                    new_x2 = 1.0 - boxes[:, 0]
+                    boxes  = torch.stack(
+                        [new_x1, boxes[:, 1], new_x2, boxes[:, 3]], dim=1
+                    )
+        else:
+            # Validation: deterministic resize only
+            img = self._resize(img)
+            img_tensor = self._to_tensor(img)
+
+        target["boxes"]  = boxes
+        target["labels"] = labels
         return img_tensor, target
 
 

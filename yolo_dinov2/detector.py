@@ -19,6 +19,7 @@
 #     (B, 768, H, W) feature maps so the RL validator can use cached features.
 # =============================================================================
 
+import math
 import types
 import torch
 import torch.nn as nn
@@ -181,7 +182,12 @@ class DinoPrunableDetector(nn.Module):
         # Anchor-free detection head: single feature scale at stride 14
         self.head = Detect(nc=nc, ch=(embed,))
         self.head.stride = torch.tensor([STRIDE])
-        self.head.bias_init()   # initialise detection biases using stride info
+        self.head.bias_init()   # initialise detection biases (uses 640px reference)
+        # Correct class bias for our 518px input: log(5/nc/(IMG_SIZE/stride)^2)
+        # bias_init() uses (640/stride)^2 = 2090; correct value is (518/14)^2 = 1369
+        _correct_cls_bias = math.log(5.0 / nc / (518.0 / STRIDE) ** 2)
+        for seq in self.head.cv3:
+            seq[-1].bias.data[:nc] = _correct_cls_bias
 
         self.nc = nc
 

@@ -359,8 +359,9 @@ def evaluate(model, loader, device, datadir=None):
         print("[evaluate] ERROR: no COCO ground-truth available. Pass --datadir. Returning mAP=0.")
         return 0.0, 0.0, 0.0
 
-    iou_sum:   float = 0.0
-    iou_count: int   = 0
+    iou_sum:      float = 0.0
+    iou_count:    int   = 0
+    recall01_num: int   = 0
 
     with torch.no_grad():
         for batch_data, targets in tqdm(loader, desc="Eval", leave=False):
@@ -375,8 +376,10 @@ def evaluate(model, loader, device, datadir=None):
                     gt_px = gt_norm * IMG_SIZE                  # scale to 224-px space
                     gt_px = gt_px.to(device)
                     if det.shape[0] > 0:
-                        iou_mat = box_iou(gt_px, det[:, :4])   # (G, N)
-                        iou_sum += iou_mat.max(dim=1).values.sum().item()
+                        iou_mat  = box_iou(gt_px, det[:, :4])   # (G, N)
+                        max_iou  = iou_mat.max(dim=1).values
+                        iou_sum      += max_iou.sum().item()
+                        recall01_num += int((max_iou >= 0.1).sum().item())
                     iou_count += gt_norm.shape[0]
 
                 # ── COCOeval ─────────────────────────────────────────────────
@@ -393,7 +396,21 @@ def evaluate(model, loader, device, datadir=None):
                         "score": score,
                     })
 
-    mean_iou        = iou_sum / iou_count if iou_count > 0 else 0.0
+    mean_iou = iou_sum / iou_count if iou_count > 0 else 0.0
+    recall01 = recall01_num / iou_count if iou_count > 0 else 0.0
+
+    avg_preds_per_img = len(coco_results) / max(1, len(loader.dataset))
+    avg_conf = (
+        sum(r["score"] for r in coco_results) / len(coco_results)
+        if coco_results else 0.0
+    )
+    print(
+        f"  [eval] coco_results={len(coco_results)}  "
+        f"avg_preds/img={avg_preds_per_img:.1f}  "
+        f"avg_conf={avg_conf:.4f}  "
+        f"recall@IoU>=0.1={recall01:.4f}"
+    )
+
     map50 = map50_95 = 0.0
     if coco_results:
         coco_dt   = coco_gt.loadRes(coco_results)
@@ -403,7 +420,7 @@ def evaluate(model, loader, device, datadir=None):
         map50    = float(coco_eval.stats[1])
     else:
         print("Warning: no detections above conf_thres=0.001 — mAP is 0.")
-    return map50, map50_95, mean_iou
+    return map50, map50_95, mean_iou, recall01
 
 
 # ── Datasets (inlined — identical to yolov3 version) ─────────────────────────
@@ -576,7 +593,7 @@ def main(args):
         t_loss, box_l, cls_l, dfl_l = train_one_epoch(
             model, criterion, train_loader, optimizer, device,
             epoch=epoch, debug_grads=args.debug_grads, debug_every=args.debug_every)
-        map50, map50_95, mean_iou = evaluate(model, val_loader, device, datadir=args.datadir)
+        map50, map50_95, mean_iou, recall01 = evaluate(model, val_loader, device, datadir=args.datadir)
         val_loss = _compute_val_loss(model, val_loader, criterion, device, n_batches=50)
         scheduler.step()
 
@@ -587,7 +604,8 @@ def main(args):
         print(f"Epoch {epoch+1:02d}/{args.epochs} | LR {current_lr:.2e} | "
               f"Train {t_loss:.3f} (box {box_l:.3f} cls {cls_l:.3f} dfl {dfl_l:.3f}) | "
               f"Val loss {val_loss:.3f} | "
-              f"mAP@0.5 {map50:.4f}  mAP@0.5:0.95 {map50_95:.4f} | MeanIoU {mean_iou:.4f}")
+              f"mAP@0.5 {map50:.4f}  mAP@0.5:0.95 {map50_95:.4f} | "
+              f"MeanIoU {mean_iou:.4f}  recall@0.1 {recall01:.4f}")
 
         torch.save({"epoch": epoch+1, "model_state_dict": model.state_dict(),
                     "map50": map50, "map50_95": map50_95, "val_loss": val_loss, "mean_iou": mean_iou},
