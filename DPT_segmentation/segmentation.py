@@ -105,7 +105,12 @@ class DinoSegmenter(DPTSegmentationModel):
         with torch.set_grad_enabled(True):
             # Updated forward pass to unpack tuple and force ViT routing
             _, logits = self(images, features=False)
-            loss = criterion(logits, labels)
+            # Map all out-of-bounds labels (like -1 background) to PyTorch's safe ignore_index
+            labels[(labels < 0) | (labels >= 150)] = -100
+            safe_criterion = torch.nn.CrossEntropyLoss(ignore_index=-100)
+
+            # Use the locally enforced safe criterion
+            loss = safe_criterion(logits, labels)
 
             # 3. Backward pass
             self.zero_grad()
