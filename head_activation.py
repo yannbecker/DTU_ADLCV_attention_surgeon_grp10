@@ -342,9 +342,6 @@ def main():
         )
         model = DinoSegmenter(device=device, num_classes=150).to(device)
 
-        # Link transformer backbone to DPT's pretrained model for HeadCensus compatibility
-        model.transformer = model.pretrained.model
-
     else:
         print(f"Task {args.task} not yet implemented.")
         return
@@ -361,6 +358,10 @@ def main():
         print(
             f"[!] Warning: Checkpoint {args.checkpoint} not found. Running with random weights."
         )
+
+    if args.task == "segmentation":
+        # Link transformer backbone to DPT's pretrained model for HeadCensus compatibility
+        model.transformer = model.pretrained.model
 
     # Execute Census and save visualizations
     census = HeadCensus(model, device)

@@ -409,6 +409,9 @@ def train_ppo(args):
     else:
         raise FileNotFoundError(f"Could not find checkpoint at {args.checkpoint}")
 
+    if task == "segmentation":
+        model.transformer = model.pretrained.model
+
     # Initialize Environment
     env = PruningEnv(model, train_loader, device, max_pruning=args.max_pruning)
     policy = AdvancedActorCritic(n_metrics=7).to(device)
