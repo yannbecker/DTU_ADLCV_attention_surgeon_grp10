@@ -194,7 +194,7 @@ class HeadCensus:
         torch.set_grad_enabled(True)
         # Use ignore_index=-1 for ADE20K background class
         if is_segmentation:
-            criterion = torch.nn.CrossEntropyLoss(ignore_index=-1)
+            criterion = torch.nn.CrossEntropyLoss(ignore_index=-100)
         else:
             criterion = torch.nn.CrossEntropyLoss()
 
@@ -209,6 +209,10 @@ class HeadCensus:
                 images, labels = batch
 
             images, labels = images.to(self.device), labels.to(self.device)
+
+            if is_segmentation:
+                # Map any out-of-bounds labels (like 254 or -1) to the safe ignore_index (-100)
+                labels[(labels < 0) | (labels >= 150)] = -100
 
             # 1. Forward pass & collect maps for Rollout
             layer_attns = []  # To store (B, H, N, N) per layer
