@@ -42,10 +42,13 @@ from head_activation import HeadCensus
 
 
 class PruningEnv:
-    def __init__(self, model, dataloader, device, max_pruning=72):
+    def __init__(
+        self, model, dataloader, device, task="classification", max_pruning=72
+    ):
         self.model = model
         self.device = device
         self.max_pruning = max_pruning  # Up to 72 heads
+        self.task = task
 
         self.num_heads = 144
         self.base_flops = self.num_heads  # Simplified proxy for FLOPs
@@ -416,7 +419,9 @@ def train_ppo(args):
         model.transformer = model.pretrained.model
 
     # Initialize Environment
-    env = PruningEnv(model, train_loader, device, max_pruning=args.max_pruning)
+    env = PruningEnv(
+        model, train_loader, device, task=task, max_pruning=args.max_pruning
+    )
     policy = AdvancedActorCritic(n_metrics=7).to(device)
     optimizer = optim.Adam(policy.parameters(), lr=args.lr)
     eps_clip = 0.2
