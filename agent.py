@@ -23,8 +23,10 @@ from classification import DinoClassifier
 from classification import get_loaders as get_loaders_cls
 
 # Task 2: Segmentation
-from DPT_segmentation.segmentation import DinoSegmenter
-from DPT_segmentation.segmentation import get_loaders as get_loaders_seg
+current_dir = os.path.dirname(os.path.abspath(__file__))
+sys.path.append(os.path.join(current_dir, "DPT_segmentation"))
+from segmentation import DinoSegmenter
+from segmentation import get_loaders as get_loaders_seg
 
 # Utils
 from rl_utils import (
