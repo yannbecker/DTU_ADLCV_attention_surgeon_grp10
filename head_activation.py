@@ -14,7 +14,14 @@ import matplotlib.pyplot as plt
 import argparse
 import os
 from tqdm import tqdm
-from classification import DinoClassifier, get_loaders
+
+# Task 1: Classification
+from classification import DinoClassifier
+from classification import get_loaders as get_loaders_cls
+
+# Task 2: Segmentation
+from DPT_segmentation.segmentation import DinoSegmenter
+from DPT_segmentation.segmentation import get_loaders as get_loaders_seg
 
 # ----------------- METRIC FUNCTIONS -----------------
 
@@ -179,14 +186,25 @@ class HeadCensus:
         contribution = torch.norm(out_per_head, p=2, dim=-1)  # (B, H, N)
         return contribution.mean(dim=(0, 2))  # (H,)
 
-    def run_census(self, dataloader, num_batches=10):
+    def run_census(self, dataloader, num_batches=10, is_segmentation=False):
         self.model.eval()
         torch.set_grad_enabled(True)
-        criterion = torch.nn.CrossEntropyLoss()
+        # Use ignore_index=-1 for ADE20K background class
+        if is_segmentation:
+            criterion = torch.nn.CrossEntropyLoss(ignore_index=-1)
+        else:
+            criterion = torch.nn.CrossEntropyLoss()
 
-        for b_idx, (images, labels) in enumerate(tqdm(dataloader, desc="Census")):
+        for b_idx, batch in enumerate(tqdm(dataloader, desc="Census")):
             if b_idx >= num_batches:
                 break
+
+            # Dynamically handle 2 or 3 returned elements from datasets
+            if len(batch) == 3:
+                images, labels, _ = batch
+            else:
+                images, labels = batch
+
             images, labels = images.to(self.device), labels.to(self.device)
 
             # 1. Forward pass & collect maps for Rollout
@@ -219,14 +237,26 @@ class HeadCensus:
                     self.head_metrics[2, i] += rollout_maps[i].mean()
 
             # Get taylor Importance and Intra-Layer Rank metrics
-            batch_taylor = self.model.get_taylor_importance(images, labels, criterion)
-            batch_ranks = self.model.get_intra_layer_ranks(batch_taylor)
-            self.head_metrics[5, :, :] += batch_taylor
-            self.head_metrics[6, :, :] += batch_ranks
+            # Safety check: Only compute Taylor Metrics if the model implements them
+            if hasattr(self.model, "get_taylor_importance"):
+                batch_taylor = self.model.get_taylor_importance(
+                    images, labels, criterion
+                )
+                batch_ranks = self.model.get_intra_layer_ranks(batch_taylor)
+                self.head_metrics[5, :, :] += batch_taylor
+                self.head_metrics[6, :, :] += batch_ranks
+            elif b_idx == 0:
+                print(
+                    "\n[!] Warning: 'get_taylor_importance' not found in model. Metrics 5 and 6 will be blank."
+                )
 
         # Normalize across batches (excluding static Depth at index 3)
         for idx in [0, 1, 2, 4]:
             self.head_metrics[idx] /= num_batches
+
+        if hasattr(self.model, "get_taylor_importance"):
+            self.head_metrics[5] /= num_batches
+            self.head_metrics[6] /= num_batches
 
     def plot_results(self, task_name):
         metric_names = [
@@ -295,30 +325,39 @@ def main():
     args = parser.parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Load Task-Specific Model and Dataloader
     if args.task == "classification":
-        # Initialize the DINOv2-based classifier
-        _, dataloader, num_classes = get_loaders(
+        _, dataloader, num_classes = get_loaders_cls(
             args.dataset, args.data_dir, args.batch_size, num_workers=2
         )
         model = DinoClassifier(device=device, num_classes=num_classes).to(device)
 
-        # Load the trained linear probe weights
-        if os.path.exists(args.checkpoint):
-            checkpoint = torch.load(args.checkpoint, map_location=device)
-            model.load_state_dict(checkpoint["model_state_dict"])
-            print(f"Loaded weights from {args.checkpoint}")
-        else:
-            print(
-                f"Warning: Checkpoint {args.checkpoint} not found. Running with random head."
-            )
+    elif args.task == "segmentation":
+        is_seg = True
+        # Critical: features=False to ensure raw RGB goes through the ViT for the census
+        _, dataloader = get_loaders_seg(
+            args.data_dir, args.batch_size, num_workers=2, use_features=False
+        )
+        model = DinoSegmenter(device=device, num_classes=150).to(device)
+
+        # Link transformer backbone to DPT's pretrained model for HeadCensus compatibility
+        model.transformer = model.pretrained.model
 
     else:
-        # Placeholder for Task 2 and 3 implementation
-        print(
-            f"Task {args.task} not yet implemented. Please create detection.py/segmentation.py"
-        )
+        print(f"Task {args.task} not yet implemented.")
         return
+
+    # Load weights
+    if os.path.exists(args.checkpoint):
+        checkpoint = torch.load(args.checkpoint, map_location=device)
+        if "model_state_dict" in checkpoint:
+            model.load_state_dict(checkpoint["model_state_dict"])
+        else:
+            model.load_state_dict(checkpoint)
+        print(f"[OK] Loaded weights from {args.checkpoint}")
+    else:
+        print(
+            f"[!] Warning: Checkpoint {args.checkpoint} not found. Running with random weights."
+        )
 
     # Execute Census and save visualizations
     census = HeadCensus(model, device)
