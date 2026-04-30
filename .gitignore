@@ -6,6 +6,8 @@ checkpoints*/
 *.out
 *.err
 test_*.py
+models_segmentation/
+test.py
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -14,6 +16,9 @@ __pycache__/
 playground.md
 # C extensions
 *.so
+
+# DS_Store
+.DS_Store
 
 # Distribution / packaging
 .Python
