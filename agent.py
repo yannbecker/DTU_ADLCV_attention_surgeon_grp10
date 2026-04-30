@@ -386,10 +386,6 @@ def train_ppo(args):
         )
         model = DinoSegmenter(device, num_classes=150).to(device)
 
-        # Patch the forward function so HeadCensus (which calls model(x) without kwargs) uses features=False
-        original_forward = model.forward
-        model.forward = lambda x: original_forward(x, features=False)
-
     elif task == "classification":
         train_loader, val_loader, num_classes = get_loaders_cls(
             dataset_name, args.data_dir, args.batch_size, num_workers=2
