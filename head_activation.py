@@ -212,7 +212,17 @@ class HeadCensus:
 
             # 1. Forward pass & collect maps for Rollout
             layer_attns = []  # To store (B, H, N, N) per layer
+
+            # DPT turns patch_size into a list, but DINOv2 expects an int.
+            saved_patch_size = self.model.transformer.patch_size
+            if isinstance(saved_patch_size, list):
+                self.model.transformer.patch_size = saved_patch_size[0]
+
+            # Extract tokens
             x = self.model.transformer.prepare_tokens_with_masks(images)
+
+            # Revert back to the list so we don't break the rest of the model
+            self.model.transformer.patch_size = saved_patch_size
 
             for i in range(self.num_layers):
                 attn_map, _ = self.get_attention_map(x, i)
