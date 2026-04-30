@@ -23,11 +23,14 @@ python3 baselines.py \\
     --metrics     magnitude entropy distance taylor random greedy \\
     --prune_steps 0 2 4 6 8 10 12 24 36 48 60 72 84 96 \\
     --calib_batches 20 \\
-    --n_random    5 \\
+    --n_random    10\\
     --proxy_batches 1 \\
     --force_recalc entropy random \\
     --device      cuda \\
     --save_dir    results/baselines
+
+One line command: 
+python3 baselines.py --checkpoint checkpoints/dino_imagenet100_latest.pth --dataset imagenet100 --data_dir /dtu/datasets1/imagenet_object_localization_patched2019 --metrics magnitude entropy distance taylor random greedy --prune_steps 0 2 4 6 8 10 12 24 36 48 60 72 84 96 --calib_batches 20 --n_random 10 --proxy_batches 1 --force_recalc entropy random --device cuda --save_dir results/baselines
 
 Available metrics
 -----------------
