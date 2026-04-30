@@ -7,14 +7,8 @@ each strategy across requested pruning levels and plots the curves.
 
 Usage
 -----
-python3 baselines.py \\
-    --checkpoint  checkpoints/dino_imagenet100_latest.pth \\
-    --dataset     imagenet100 \\
-    --data_dir    /dtu/datasets1/imagenet_object_localization_patched2019 \\
-    --metrics     magnitude entropy distance taylor random greedy \\
-    --prune_steps 0 12 24 36 48 60 72 84 96 \\
-    --calib_batches 20 \\
-    --save_dir    results/baselines
+python3 baselines.py --checkpoint checkpoints/dino_imagenet100_latest.pth --dataset imagenet100 --data_dir /dtu/datasets1/imagenet_object_localization_patched2019 --metrics magnitude entropy distance taylor random greedy --prune_steps 0 12 
+24 36 48 60 72 84 96 --device cuda --save_dir results/baselines
 
 Available metrics
 -----------------
