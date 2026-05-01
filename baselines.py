@@ -126,12 +126,15 @@ def score_magnitude(
 
     model.eval()
     with torch.no_grad():
-        for b_idx, (images, _) in enumerate(
+        for b_idx, batch in enumerate(
             tqdm(loader, desc="  [magnitude] calibrate", leave=False)
         ):
             if b_idx >= calib_batches:
                 break
-            images = images.to(device)
+
+            # Dynamically grab images (always the first element) to avoid unpacking errors
+            images = batch[0].to(device)
+
             if task == "segmentation":
                 model(images, features=False)
             else:
