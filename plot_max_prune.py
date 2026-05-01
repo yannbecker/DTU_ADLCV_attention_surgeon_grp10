@@ -1,17 +1,28 @@
 import os
+import sys
 import argparse
 import re
 import math
 import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
+from torchmetrics.classification import MulticlassJaccardIndex
 
-from classification import DinoClassifier, get_loaders
+# --- Task 1: Classification ---
+from classification import DinoClassifier
+from classification import get_loaders as get_loaders_cls
+
+# --- Task 2: Segmentation ---
+current_dir = os.path.dirname(os.path.abspath(__file__))
+sys.path.append(os.path.join(current_dir, "DPT_segmentation"))
+from segmentation import DinoSegmenter
+from segmentation import get_loaders as get_loaders_seg
+
 from agent import AdvancedActorCritic, PruningEnv
 
 
 def parse_agent_log(log_path):
-    """Parses the text log file to extract the full test accuracies."""
+    """Parses the text log file to extract the full test accuracies/mIoUs."""
     parsed_data = {}
     current_agent = "AttentionSurgeon Agent"
 
@@ -39,8 +50,8 @@ def parse_agent_log(log_path):
             if match_step and i + 1 < len(lines):
                 step = int(match_step.group(1))
                 next_line = lines[i + 1]
-                # Find the corresponding accuracy on the next line
-                match_acc = re.search(r"Full Test Acc: ([\d.]+)%", next_line)
+                # Regex handles both "Full Test Acc: XX.XX%" and "Full Test mIoU: XX.XX%"
+                match_acc = re.search(r"Full Test (?:Acc|mIoU): ([\d.]+)%", next_line)
                 if match_acc:
                     acc = float(match_acc.group(1))
                     parsed_data[current_agent].append((step, acc))
@@ -48,20 +59,50 @@ def parse_agent_log(log_path):
     return parsed_data
 
 
-def evaluate_agent_trajectory(
-    agent_path, x_vals, model, test_loader, criterion, device
-):
+def apply_mask(model, mask, task):
+    """Safely applies the mask depending on the backbone architecture."""
+    if task == "segmentation":
+        model.pretrained.model.mask = mask.float()
+    else:
+        model.mask = mask.float()
+
+
+def evaluate_agent_trajectory(agent_path, x_vals, model, test_loader, device, task):
     """Loads ONE master agent and evaluates its performance progressively."""
     agent = AdvancedActorCritic(n_metrics=7).to(device)
     agent.load_state_dict(torch.load(agent_path, map_location=device))
     agent.eval()
 
     max_steps = max(x_vals)
-    env = PruningEnv(model, test_loader, device, max_pruning=max_steps)
+    env = PruningEnv(model, test_loader, device, task=task, max_pruning=max_steps)
     state = env.reset()
 
     trajectory_results = []
     print(f"Unrolling single agent trajectory up to {max_steps} steps...")
+
+    def eval_model():
+        model.eval()
+        if task == "segmentation":
+            metric = MulticlassJaccardIndex(num_classes=150, ignore_index=-100).to(
+                device
+            )
+            with torch.no_grad():
+                for images, labels in test_loader:
+                    images, labels = images.to(device), labels.to(device)
+                    labels[(labels < 0) | (labels >= 150)] = -100
+                    _, outputs = model(images, features=False)
+                    metric.update(outputs, labels)
+            res = metric.compute().item() * 100.0
+            metric.reset()
+            return res
+        else:
+            correct, total = 0, 0
+            with torch.no_grad():
+                for images, labels in test_loader:
+                    images, labels = images.to(device), labels.to(device)
+                    correct += model(images).argmax(1).eq(labels).sum().item()
+                    total += labels.size(0)
+            return 100.0 * correct / total
 
     with torch.no_grad():
         for step in range(1, max_steps + 1):
@@ -73,27 +114,19 @@ def evaluate_agent_trajectory(
                 print(
                     f"  [Pause Surgery] Evaluating full test set at {step} pruned heads..."
                 )
-                model.set_mask(env.mask)
-                correct, total = 0, 0
-                for images, labels in test_loader:
-                    images, labels = images.to(device), labels.to(device)
-                    correct += model(images).argmax(1).eq(labels).sum().item()
-                    total += labels.size(0)
-                full_acc = 100.0 * correct / total
+                apply_mask(model, env.mask, task)
+                full_acc = eval_model()
                 trajectory_results.append((step, full_acc))
-                print(f"  -> Full Test Acc: {full_acc:.2f}%")
+                metric_name = "mIoU" if task == "segmentation" else "Acc"
+                print(f"  -> Full Test {metric_name}: {full_acc:.2f}%")
 
             if done:
                 break
 
     # Add the 0-prune baseline
-    model.set_mask(torch.ones(12, 12, device=device))
-    correct, total = 0, 0
-    for images, labels in test_loader:
-        images, labels = images.to(device), labels.to(device)
-        correct += model(images).argmax(1).eq(labels).sum().item()
-        total += labels.size(0)
-    trajectory_results.insert(0, (0, 100.0 * correct / total))
+    apply_mask(model, torch.ones(12, 12, device=device), task)
+    full_acc = eval_model()
+    trajectory_results.insert(0, (0, full_acc))
 
     return trajectory_results
 
@@ -166,24 +199,38 @@ def main(args):
 
     else:
         print(f"\n--- Loading Full Model for Checkpoint Trajectory Evaluation ---")
-        train_loader, test_loader, num_classes = get_loaders(
-            args.dataset, args.data_dir, args.batch_size, num_workers=2
-        )
-        model = DinoClassifier(device=device, num_classes=num_classes).to(device)
+
+        # Load correct architecture based on task
+        if args.task == "classification":
+            train_loader, test_loader, num_classes = get_loaders_cls(
+                args.dataset, args.data_dir, args.batch_size, num_workers=2
+            )
+            model = DinoClassifier(device=device, num_classes=num_classes).to(device)
+        else:
+            train_loader, test_loader = get_loaders_seg(
+                args.data_dir, args.batch_size, num_workers=2, use_features=False
+            )
+            model = DinoSegmenter(device, num_classes=150).to(device)
+            model.transformer = model.pretrained.model
 
         if os.path.exists(args.checkpoint):
-            model.load_state_dict(
-                torch.load(args.checkpoint, map_location=device)["model_state_dict"]
-            )
+            ckpt = torch.load(args.checkpoint, map_location=device)
+            if "model_state_dict" in ckpt:
+                model.load_state_dict(ckpt["model_state_dict"], strict=False)
+            else:
+                model.load_state_dict(ckpt, strict=False)
         else:
             raise FileNotFoundError(f"Base weights not found at {args.checkpoint}")
 
-        criterion = nn.CrossEntropyLoss()
+        # Fix PyTorch alias registration
+        if args.task == "segmentation":
+            model.transformer = model.pretrained.model
+
         master_agent_path = os.path.join(
             args.agent_dir,
             (
                 f"surgeon_ppo_best_segmentation.pth"
-                if "seg" in args.dataset
+                if "seg" in args.dataset or args.task == "segmentation"
                 else f"surgeon_ppo_best_50prune.pth"
             ),
         )
@@ -191,7 +238,7 @@ def main(args):
         if os.path.exists(master_agent_path):
             print(f"\nEvaluating Master Agent...")
             agent_data = evaluate_agent_trajectory(
-                master_agent_path, target_x_vals, model, test_loader, criterion, device
+                master_agent_path, target_x_vals, model, test_loader, device, args.task
             )
             results["AttentionSurgeon Agent"] = sorted(agent_data)
         else:
@@ -241,12 +288,22 @@ def main(args):
         fontsize=16,
         fontweight="bold",
     )
+
+    # Dynamic Axis Label
+    metric_label = (
+        "Validation mIoU (%)"
+        if args.task == "segmentation"
+        else "Validation Accuracy (%)"
+    )
+
     plt.xlabel("Number of Pruned Heads", fontsize=12)
-    plt.ylabel("Validation Accuracy (%)", fontsize=12)
+    plt.ylabel(metric_label, fontsize=12)
     plt.grid(True, linestyle="--", alpha=0.6)
     plt.legend(loc="lower left", fontsize=10)
 
-    save_path = os.path.join(args.save_dir, f"ultimate_comparison_{args.dataset}.png")
+    save_path = os.path.join(
+        args.save_dir, f"ultimate_comparison_{args.dataset}_{args.task}.png"
+    )
     plt.tight_layout()
     plt.savefig(save_path, dpi=300)
     print(f"\nSuccess! Ultimate comparison graph saved to: {save_path}")
@@ -254,6 +311,12 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--task",
+        type=str,
+        choices=["classification", "segmentation"],
+        default="classification",
+    )
     parser.add_argument("--agent_dir", type=str, default="./checkpoints_rl")
     parser.add_argument("--dataset", type=str, default="imagenet100")
     parser.add_argument("--data_dir", type=str, default="./data")
@@ -261,7 +324,9 @@ if __name__ == "__main__":
         "--checkpoint", type=str, default="checkpoints/dino_imagenet100_latest.pth"
     )
     parser.add_argument(
-        "--baseline_cache", type=str, default="results/baselines/pruning_results.pt"
+        "--baseline_cache",
+        type=str,
+        default="results/baselines/pruning_results_classification.pt",
     )
     parser.add_argument(
         "--agent_log",
