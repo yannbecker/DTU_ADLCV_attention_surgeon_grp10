@@ -232,8 +232,9 @@ def evaluate(model: nn.Module, loader, device, task: str) -> float:
     if task == "classification":
         correct, total = 0, 0
         with torch.no_grad():
-            for images, labels in loader:
-                images, labels = images.to(device), labels.to(device)
+            for batch in loader:
+                # Safely extract images and labels regardless of batch tuple length
+                images, labels = batch[0].to(device), batch[1].to(device)
                 correct += model(images).argmax(1).eq(labels).sum().item()
                 total += labels.size(0)
         return 100.0 * correct / total
@@ -241,8 +242,9 @@ def evaluate(model: nn.Module, loader, device, task: str) -> float:
         # Segmentation: compute Jaccard Index (mIoU)
         metric = MulticlassJaccardIndex(num_classes=150, ignore_index=-100).to(device)
         with torch.no_grad():
-            for images, labels in loader:
-                images, labels = images.to(device), labels.to(device)
+            for batch in loader:
+                # Safely extract images and labels
+                images, labels = batch[0].to(device), batch[1].to(device)
                 labels[(labels < 0) | (labels >= 150)] = -100
                 _, outputs = model(images, features=False)
                 metric.update(outputs, labels)
@@ -257,10 +259,12 @@ def evaluate_proxy_loss(
     model.eval()
     total, n = 0.0, 0
     with torch.no_grad():
-        for b_idx, (images, labels) in enumerate(loader):
+        for b_idx, batch in enumerate(loader):
             if b_idx >= proxy_batches:
                 break
-            images, labels = images.to(device), labels.to(device)
+
+            # Safely extract images and labels
+            images, labels = batch[0].to(device), batch[1].to(device)
 
             if task == "segmentation":
                 labels[(labels < 0) | (labels >= 150)] = -100
