@@ -2,54 +2,13 @@ import os
 import glob
 import argparse
 import re
+import math
 import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 
 from classification import DinoClassifier, get_loaders
-from baseline import compute_head_magnitudes, get_pruning_mask, evaluate
 from agent import AdvancedActorCritic, PruningEnv
-
-
-def parse_out_file(filepath):
-    best_acc = None
-    try:
-        with open(filepath, "r") as f:
-            lines = f.readlines()
-        for i, line in enumerate(lines):
-            if "*** New Best Reward!" in line:
-                if i + 1 < len(lines):
-                    next_line = lines[i + 1]
-                    match = re.search(r"Final Step Acc: ([\d.]+)%", next_line)
-                    if match:
-                        best_acc = float(match.group(1))
-    except Exception as e:
-        print(f"[!] Error reading {filepath}: {e}")
-    return best_acc
-
-
-def evaluate_agent(agent_path, max_prune, model, test_loader, criterion, device):
-    """Loads an RL agent, performs greedy pruning, and evaluates on the full test set."""
-    agent = AdvancedActorCritic(n_metrics=7).to(device)
-    agent.load_state_dict(torch.load(agent_path, map_location=device))
-    agent.eval()
-
-    # We use the test_loader so the proxy is drawn from the validation set
-    env = PruningEnv(model, test_loader, device, max_pruning=max_prune)
-    state = env.reset()
-
-    with torch.no_grad():
-        for _ in range(max_prune):
-            dist, _ = agent(state["metric_grid"], state["scalars"], state["mask"])
-            action = dist.probs.argmax()  # Greedy deterministic rollout
-            state, _, done = env.step(action.item())
-            if done:
-                break
-
-    # Evaluate the final mask on the FULL test set
-    model.set_mask(env.mask)
-    _, full_acc = evaluate(model, test_loader, criterion, device)
-    return full_acc
 
 
 def evaluate_agent_trajectory(
@@ -72,25 +31,71 @@ def evaluate_agent_trajectory(
     print(f"Unrolling single agent trajectory up to {max_steps} steps...")
     with torch.no_grad():
         for step in range(1, max_steps + 1):
-            # Agent picks the next head to prune
             dist, _ = agent(state["metric_grid"], state["scalars"], state["mask"])
             action = dist.probs.argmax()
             state, _, done = env.step(action.item())
 
-            # If the current step is one of our target x_vals, evaluate the full test set
             if step in x_vals:
                 print(
                     f"  [Pause Surgery] Evaluating full test set at {step} pruned heads..."
                 )
                 model.set_mask(env.mask)
-                _, full_acc = evaluate(model, test_loader, criterion, device)
+                correct, total = 0, 0
+                for images, labels in test_loader:
+                    images, labels = images.to(device), labels.to(device)
+                    correct += model(images).argmax(1).eq(labels).sum().item()
+                    total += labels.size(0)
+                full_acc = 100.0 * correct / total
+
                 trajectory_results.append((step, full_acc))
                 print(f"  -> Full Test Acc: {full_acc:.2f}%")
 
             if done:
                 break
 
+    # Add the 0-prune baseline (starting accuracy)
+    model.set_mask(torch.ones(12, 12, device=device))
+    correct, total = 0, 0
+    for images, labels in test_loader:
+        images, labels = images.to(device), labels.to(device)
+        correct += model(images).argmax(1).eq(labels).sum().item()
+        total += labels.size(0)
+    trajectory_results.insert(0, (0, 100.0 * correct / total))
+
     return trajectory_results
+
+
+def load_baselines_from_cache(cache_path, max_x=50):
+    """Extracts all calculated baselines from the baselines.py cache."""
+    baseline_results = {}
+    if not os.path.exists(cache_path):
+        print(f"[!] Baseline cache not found at {cache_path}. Run baselines.py first!")
+        return baseline_results
+
+    cache = torch.load(cache_path, map_location="cpu").get("results", {})
+
+    for metric, data_dict in cache.items():
+        if not isinstance(data_dict, dict):
+            continue
+
+        if metric == "random":
+            pts = []
+            for step, seed_list in data_dict.items():
+                if int(step) <= max_x:
+                    valid_seeds = [v for v in seed_list if not math.isnan(v)]
+                    if valid_seeds:
+                        pts.append((int(step), sum(valid_seeds) / len(valid_seeds)))
+            baseline_results[f"Baseline ({metric})"] = sorted(pts)
+        else:
+            pts = [
+                (int(step), acc)
+                for step, acc in data_dict.items()
+                if int(step) <= max_x
+            ]
+            baseline_results[f"Baseline ({metric})"] = sorted(pts)
+
+    print(f"[✓] Loaded {len(baseline_results)} baselines from cache.")
+    return baseline_results
 
 
 def main(args):
@@ -99,282 +104,111 @@ def main(args):
     )
     os.makedirs(args.save_dir, exist_ok=True)
 
-    # Store results dynamically: { 'series_name': [(x1, y1), (x2, y2)] }
     results = {}
-    all_x_vals = set()  # Keep track of all evaluated max_prune values for the baseline
+    target_x_vals = [i for i in range(2, 51, 2)]
 
-    # ---------------------------------------------------------
-    # MODE: LOGS
-    # ---------------------------------------------------------
-    if args.mode == "logs":
-        search_pattern = os.path.join(args.log_dir, f"*_{args.dataset}_*prune.out")
-        files = glob.glob(search_pattern)
-        print(f"Found {len(files)} log files.")
+    # 1. Load the Baselines
+    if args.baseline_cache:
+        baselines = load_baselines_from_cache(args.baseline_cache, max_x=50)
+        results.update(baselines)
 
-        log_data = []
-        for filepath in files:
-            match = re.search(r"_(\d+)prune\.out$", os.path.basename(filepath))
-            if match:
-                max_prune = int(match.group(1))
-                best_acc = parse_out_file(filepath)
-                if best_acc is not None:
-                    log_data.append((max_prune, best_acc))
-                    all_x_vals.add(max_prune)
+    # 2. Evaluate the Master Agent
+    print(f"\n--- Loading Full Model for Checkpoint Trajectory Evaluation ---")
+    train_loader, test_loader, num_classes = get_loaders(
+        args.dataset, args.data_dir, args.batch_size, num_workers=2
+    )
+    model = DinoClassifier(device=device, num_classes=num_classes).to(device)
 
-        if log_data:
-            results["Logs (Proxy Acc)"] = sorted(log_data)
-
-    # ---------------------------------------------------------
-    # MODE: CHECKPOINTS (Best and/or Latest)
-    # ---------------------------------------------------------
-    elif args.mode == "checkpoints":
-        print(f"\n--- Loading Full Model for Checkpoint Evaluation ---")
-        train_loader, test_loader, num_classes = get_loaders(
-            args.dataset, args.data_dir, args.batch_size, num_workers=2
+    if os.path.exists(args.checkpoint):
+        model.load_state_dict(
+            torch.load(args.checkpoint, map_location=device)["model_state_dict"]
         )
-        model = DinoClassifier(device=device, num_classes=num_classes).to(device)
+    else:
+        raise FileNotFoundError(f"Base weights not found at {args.checkpoint}")
 
-        if os.path.exists(args.checkpoint):
-            model.load_state_dict(
-                torch.load(args.checkpoint, map_location=device)["model_state_dict"]
-            )
-            print(f"[✓] Loaded DINO weights: {args.checkpoint}")
-        else:
-            raise FileNotFoundError(f"Base DINO weights not found at {args.checkpoint}")
+    criterion = nn.CrossEntropyLoss()
 
-        criterion = nn.CrossEntropyLoss()
+    master_agent_path = os.path.join(
+        args.agent_dir,
+        (
+            f"surgeon_ppo_best_segmentation.pth"
+            if "seg" in args.dataset
+            else f"surgeon_ppo_best_50prune.pth"
+        ),
+    )
 
-        for atype in args.agent_types:
-            # Expected format: surgeon_ppo_best_30prune.pth
-            pattern = os.path.join(args.agent_dir, f"surgeon_ppo_{atype}_*prune.pth")
-            files = glob.glob(pattern)
-            print(f"Found {len(files)} '{atype}' agents.")
-
-            agent_data = []
-            for f in files:
-                match = re.search(
-                    rf"surgeon_ppo_{atype}_(\d+)prune\.pth", os.path.basename(f)
-                )
-                if match:
-                    max_prune = int(match.group(1))
-                    print(f"Evaluating {atype} agent for max_prune = {max_prune}...")
-                    full_acc = evaluate_agent(
-                        f, max_prune, model, test_loader, criterion, device
-                    )
-                    agent_data.append((max_prune, full_acc))
-                    all_x_vals.add(max_prune)
-                    print(f"  -> Full Test Acc: {full_acc:.2f}%")
-
-            if agent_data:
-                results[f"Agent ({atype.capitalize()})"] = sorted(agent_data)
-
-    # ---------------------------------------------------------
-    # MODE: SINGLE CHECKPOINT (Single Master Agent Trajectory)
-    # ---------------------------------------------------------
-    elif args.mode == "single_checkpoint":
-        print(f"\n--- Loading Full Model for Checkpoint Trajectory Evaluation ---")
-        train_loader, test_loader, num_classes = get_loaders(
-            args.dataset, args.data_dir, args.batch_size, num_workers=2
+    if os.path.exists(master_agent_path):
+        print(f"\nEvaluating Master Agent...")
+        agent_data = evaluate_agent_trajectory(
+            master_agent_path, target_x_vals, model, test_loader, criterion, device
         )
-        model = DinoClassifier(device=device, num_classes=num_classes).to(device)
+        results["AttentionSurgeon Agent"] = sorted(agent_data)
+    else:
+        print(f"[!] Master agent {master_agent_path} not found.")
 
-        if os.path.exists(args.checkpoint):
-            model.load_state_dict(
-                torch.load(args.checkpoint, map_location=device)["model_state_dict"]
-            )
-        else:
-            raise FileNotFoundError(f"Base DINO weights not found at {args.checkpoint}")
-
-        criterion = nn.CrossEntropyLoss()
-
-        # Define the points you want to plot (e.g., matching the baseline)
-        target_x_vals = [i for i in range(0, 51, 2)]  # Evaluate every 2 heads up to 50
-        for v in target_x_vals:
-            all_x_vals.add(v)
-
-        for atype in args.agent_types:
-            # We specifically look for the master agent trained on the highest max_prune (e.g., 50)
-            master_agent_path = os.path.join(
-                args.agent_dir, f"surgeon_ppo_{atype}_50prune.pth"
-            )
-
-            if os.path.exists(master_agent_path):
-                print(f"\nEvaluating Master Agent ({atype})...")
-                agent_data = evaluate_agent_trajectory(
-                    master_agent_path,
-                    target_x_vals,
-                    model,
-                    test_loader,
-                    criterion,
-                    device,
-                )
-                results[f"Agent ({atype.capitalize()})"] = sorted(agent_data)
-            else:
-                print(f"[!] Master agent {master_agent_path} not found.")
-
-    # ---------------------------------------------------------
-    # BASELINE (Magnitude Sweep)
-    # ---------------------------------------------------------
-    if args.baseline and all_x_vals:
-        print(f"\n--- Running Baseline Sweep ---")
-        # Lock random seeds for reproducibility of the baseline
-        import random
-        import numpy as np
-
-        torch.manual_seed(42)
-        np.random.seed(42)
-        random.seed(42)
-
-        # Ensure model is loaded if not already loaded by checkpoints mode
-        if args.mode == "logs":
-            train_loader, test_loader, num_classes = get_loaders(
-                args.dataset, args.data_dir, args.batch_size, num_workers=2
-            )
-            model = DinoClassifier(device=device, num_classes=num_classes).to(device)
-            model.load_state_dict(
-                torch.load(args.checkpoint, map_location=device)["model_state_dict"]
-            )
-            criterion = nn.CrossEntropyLoss()
-
-        print("Computing head magnitudes on calibration set...")
-        magnitudes = compute_head_magnitudes(
-            model, train_loader, num_batches=20, device=device
-        )
-
-        baseline_data = []
-        for n_prune in sorted(list(all_x_vals)):
-            print(f"Evaluating Baseline for max_prune = {n_prune}...")
-            head_mask = get_pruning_mask(magnitudes, n_prune)
-            model.set_mask(head_mask.view(-1).float())
-            _, acc = evaluate(model, test_loader, criterion, device)
-            baseline_data.append((n_prune, acc))
-
-        results["Magnitude Baseline"] = baseline_data
-
-    # ---------------------------------------------------------
-    # PLOTTING
-    # ---------------------------------------------------------
+    # 3. Plotting
     if not results:
-        print("No data to plot. Exiting.")
         return
 
-    plt.figure(figsize=(10, 6))
+    plt.figure(figsize=(12, 7))
 
-    # Styling dictionaries for consistency
-    colors = {
-        "Logs (Proxy Acc)": "tab:blue",
-        "Agent (Best)": "tab:orange",
-        "Agent (Latest)": "tab:green",
-        "Magnitude Baseline": "tab:red",
-    }
-    markers = {
-        "Logs (Proxy Acc)": "x",
-        "Agent (Best)": "o",
-        "Agent (Latest)": "d",
-        "Magnitude Baseline": "s",
-    }
-    lines = {
-        "Logs (Proxy Acc)": ":",
-        "Agent (Best)": "-",
-        "Agent (Latest)": "-",
-        "Magnitude Baseline": "--",
-    }
-
+    # Make the Agent stand out visually against the baselines
     for label, data in results.items():
         x_vals = [dp[0] for dp in data]
         y_vals = [dp[1] for dp in data]
 
-        plt.plot(
-            x_vals,
-            y_vals,
-            label=label,
-            color=colors.get(label, "black"),
-            marker=markers.get(label, "o"),
-            linestyle=lines.get(label, "-"),
-            linewidth=2,
-            markersize=8,
-        )
-
-        # Annotate points (staggered slightly to avoid overlap)
-        y_offset = -15 if "Baseline" in label else 10
-        for x, y in zip(x_vals, y_vals):
-            plt.annotate(
-                f"{y:.1f}%",
-                (x, y),
-                textcoords="offset points",
-                xytext=(0, y_offset),
-                ha="center",
-                fontsize=8,
-                color=colors.get(label, "black"),
+        if "Agent" in label:
+            plt.plot(
+                x_vals,
+                y_vals,
+                label=label,
+                color="tab:red",
+                marker="o",
+                linestyle="-",
+                linewidth=3,
+                markersize=8,
+                zorder=10,
+            )
+        else:
+            plt.plot(
+                x_vals,
+                y_vals,
+                label=label,
+                marker="x",
+                linestyle="--",
+                linewidth=1.5,
+                alpha=0.7,
             )
 
     plt.title(
-        f"Accuracy Collapse vs. Pruned Heads ({args.dataset})",
-        fontsize=14,
+        f"AttentionSurgeon vs Baselines ({args.dataset})",
+        fontsize=16,
         fontweight="bold",
     )
-    plt.xlabel("Max Pruned Heads (Out of 144)", fontsize=12)
-    plt.ylabel("Full Validation Accuracy (%)", fontsize=12)
+    plt.xlabel("Number of Pruned Heads", fontsize=12)
+    plt.ylabel("Validation Accuracy (%)", fontsize=12)
     plt.grid(True, linestyle="--", alpha=0.6)
-    plt.legend(loc="lower left")
+    plt.legend(loc="lower left", fontsize=10)
 
-    save_path = os.path.join(
-        args.save_dir, f"max_prune_sweep_comparison_{args.dataset}.png"
-    )
+    save_path = os.path.join(args.save_dir, f"ultimate_comparison_{args.dataset}.png")
     plt.tight_layout()
     plt.savefig(save_path, dpi=300)
-    print(f"\nSuccess! Comparison graph saved to: {save_path}")
+    print(f"\nSuccess! Ultimate comparison graph saved to: {save_path}")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Evaluate RL Agents and Plot Pruning Pareto Curves."
-    )
-
-    # Mode selection
-    parser.add_argument(
-        "--mode",
-        type=str,
-        choices=["logs", "checkpoints", "single_checkpoint"],
-        default="logs",
-        help="Parse .out logs (fast) OR load agent checkpoints and evaluate full dataset (slow but accurate).",
-    )
-    parser.add_argument(
-        "--agent_types",
-        type=str,
-        nargs="+",
-        choices=["best", "latest"],
-        default=["latest"],
-        help="Which checkpoints to evaluate if mode=checkpoints. Can pass both: --agent_types best latest",
-    )
-
-    # Paths
-    parser.add_argument(
-        "--log_dir",
-        type=str,
-        default="./logs",
-        help="Folder with .out files (for logs mode)",
-    )
-    parser.add_argument(
-        "--agent_dir",
-        type=str,
-        default="./checkpoints_rl",
-        help="Folder with .pth agent weights (for checkpoints mode)",
-    )
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--agent_dir", type=str, default="./checkpoints_rl")
     parser.add_argument("--dataset", type=str, default="imagenet100")
     parser.add_argument("--data_dir", type=str, default="./data")
+    parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument(
-        "--checkpoint",
+        "--baseline_cache",
         type=str,
-        default="checkpoints/dino_imagenet100_latest.pth",
-        help="Base DINO weights",
+        default="results/baselines/pruning_results.pt",
+        help="Path to the baselines.py cache",
     )
     parser.add_argument("--save_dir", type=str, default="./results")
-
-    # Evaluation options
-    parser.add_argument(
-        "--baseline", action="store_true", help="Run the magnitude baseline sweep."
-    )
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--device", type=str, default=None)
 
