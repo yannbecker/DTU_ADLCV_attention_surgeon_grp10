@@ -1,5 +1,4 @@
 import os
-import glob
 import argparse
 import re
 import math
@@ -11,13 +10,48 @@ from classification import DinoClassifier, get_loaders
 from agent import AdvancedActorCritic, PruningEnv
 
 
+def parse_agent_log(log_path):
+    """Parses the text log file to extract the full test accuracies."""
+    parsed_data = {}
+    current_agent = "AttentionSurgeon Agent"
+
+    if not os.path.exists(log_path):
+        print(f"[!] Log file not found at {log_path}")
+        return parsed_data
+
+    with open(log_path, "r") as f:
+        lines = f.readlines()
+
+    for i, line in enumerate(lines):
+        # Identify which agent is currently being evaluated
+        if "Evaluating Master Agent" in line:
+            match = re.search(r"Evaluating Master Agent \((.*?)\)", line)
+            if match:
+                current_agent = (
+                    f"AttentionSurgeon Agent ({match.group(1).capitalize()})"
+                )
+            if current_agent not in parsed_data:
+                parsed_data[current_agent] = []
+
+        # Find the pause step
+        if "Evaluating full test set at" in line:
+            match_step = re.search(r"at (\d+) pruned heads", line)
+            if match_step and i + 1 < len(lines):
+                step = int(match_step.group(1))
+                next_line = lines[i + 1]
+                # Find the corresponding accuracy on the next line
+                match_acc = re.search(r"Full Test Acc: ([\d.]+)%", next_line)
+                if match_acc:
+                    acc = float(match_acc.group(1))
+                    parsed_data[current_agent].append((step, acc))
+
+    return parsed_data
+
+
 def evaluate_agent_trajectory(
     agent_path, x_vals, model, test_loader, criterion, device
 ):
-    """
-    Loads ONE master agent and evaluates its performance progressively
-    at specific step intervals (x_vals) during a single surgical rollout.
-    """
+    """Loads ONE master agent and evaluates its performance progressively."""
     agent = AdvancedActorCritic(n_metrics=7).to(device)
     agent.load_state_dict(torch.load(agent_path, map_location=device))
     agent.eval()
@@ -27,8 +61,8 @@ def evaluate_agent_trajectory(
     state = env.reset()
 
     trajectory_results = []
-
     print(f"Unrolling single agent trajectory up to {max_steps} steps...")
+
     with torch.no_grad():
         for step in range(1, max_steps + 1):
             dist, _ = agent(state["metric_grid"], state["scalars"], state["mask"])
@@ -46,14 +80,13 @@ def evaluate_agent_trajectory(
                     correct += model(images).argmax(1).eq(labels).sum().item()
                     total += labels.size(0)
                 full_acc = 100.0 * correct / total
-
                 trajectory_results.append((step, full_acc))
                 print(f"  -> Full Test Acc: {full_acc:.2f}%")
 
             if done:
                 break
 
-    # Add the 0-prune baseline (starting accuracy)
+    # Add the 0-prune baseline
     model.set_mask(torch.ones(12, 12, device=device))
     correct, total = 0, 0
     for images, labels in test_loader:
@@ -108,61 +141,84 @@ def main(args):
     target_x_vals = [i for i in range(2, 51, 2)]
 
     # 1. Load the Baselines
+    baselines = {}
     if args.baseline_cache:
         baselines = load_baselines_from_cache(args.baseline_cache, max_x=50)
         results.update(baselines)
 
-    # 2. Evaluate the Master Agent
-    print(f"\n--- Loading Full Model for Checkpoint Trajectory Evaluation ---")
-    train_loader, test_loader, num_classes = get_loaders(
-        args.dataset, args.data_dir, args.batch_size, num_workers=2
-    )
-    model = DinoClassifier(device=device, num_classes=num_classes).to(device)
+    # 2. Evaluate the Master Agent (FAST LOG PARSE vs HEAVY MODEL LOAD)
+    if args.agent_log:
+        print(f"\n--- FAST MODE: Parsing log file {args.agent_log} ---")
+        agent_results = parse_agent_log(args.agent_log)
 
-    if os.path.exists(args.checkpoint):
-        model.load_state_dict(
-            torch.load(args.checkpoint, map_location=device)["model_state_dict"]
-        )
+        # Grab Step 0 accuracy from baselines to anchor the curve
+        step_0_acc = None
+        for b_name, b_data in baselines.items():
+            if b_data and b_data[0][0] == 0:
+                step_0_acc = b_data[0][1]
+                break
+
+        for agent_name, agent_data in agent_results.items():
+            if step_0_acc is not None and (not agent_data or agent_data[0][0] != 0):
+                agent_data.insert(0, (0, step_0_acc))
+            results[agent_name] = agent_data
+            print(f"[✓] Extracted {len(agent_data)} points for {agent_name}")
+
     else:
-        raise FileNotFoundError(f"Base weights not found at {args.checkpoint}")
-
-    criterion = nn.CrossEntropyLoss()
-
-    master_agent_path = os.path.join(
-        args.agent_dir,
-        (
-            f"surgeon_ppo_best_segmentation.pth"
-            if "seg" in args.dataset
-            else f"surgeon_ppo_best_50prune.pth"
-        ),
-    )
-
-    if os.path.exists(master_agent_path):
-        print(f"\nEvaluating Master Agent...")
-        agent_data = evaluate_agent_trajectory(
-            master_agent_path, target_x_vals, model, test_loader, criterion, device
+        print(f"\n--- Loading Full Model for Checkpoint Trajectory Evaluation ---")
+        train_loader, test_loader, num_classes = get_loaders(
+            args.dataset, args.data_dir, args.batch_size, num_workers=2
         )
-        results["AttentionSurgeon Agent"] = sorted(agent_data)
-    else:
-        print(f"[!] Master agent {master_agent_path} not found.")
+        model = DinoClassifier(device=device, num_classes=num_classes).to(device)
+
+        if os.path.exists(args.checkpoint):
+            model.load_state_dict(
+                torch.load(args.checkpoint, map_location=device)["model_state_dict"]
+            )
+        else:
+            raise FileNotFoundError(f"Base weights not found at {args.checkpoint}")
+
+        criterion = nn.CrossEntropyLoss()
+        master_agent_path = os.path.join(
+            args.agent_dir,
+            (
+                f"surgeon_ppo_best_segmentation.pth"
+                if "seg" in args.dataset
+                else f"surgeon_ppo_best_50prune.pth"
+            ),
+        )
+
+        if os.path.exists(master_agent_path):
+            print(f"\nEvaluating Master Agent...")
+            agent_data = evaluate_agent_trajectory(
+                master_agent_path, target_x_vals, model, test_loader, criterion, device
+            )
+            results["AttentionSurgeon Agent"] = sorted(agent_data)
+        else:
+            print(f"[!] Master agent {master_agent_path} not found.")
 
     # 3. Plotting
     if not results:
+        print("No data to plot!")
         return
 
     plt.figure(figsize=(12, 7))
 
-    # Make the Agent stand out visually against the baselines
     for label, data in results.items():
         x_vals = [dp[0] for dp in data]
         y_vals = [dp[1] for dp in data]
 
         if "Agent" in label:
+            # Differentiate Best vs Latest if both are parsed
+            color = "tab:red" if "Best" in label else "tab:orange"
+            if "Best" not in label and "Latest" not in label:
+                color = "tab:red"
+
             plt.plot(
                 x_vals,
                 y_vals,
                 label=label,
-                color="tab:red",
+                color=color,
                 marker="o",
                 linestyle="-",
                 linewidth=3,
@@ -201,12 +257,17 @@ if __name__ == "__main__":
     parser.add_argument("--agent_dir", type=str, default="./checkpoints_rl")
     parser.add_argument("--dataset", type=str, default="imagenet100")
     parser.add_argument("--data_dir", type=str, default="./data")
-    parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument(
-        "--baseline_cache",
+        "--checkpoint", type=str, default="checkpoints/dino_imagenet100_latest.pth"
+    )
+    parser.add_argument(
+        "--baseline_cache", type=str, default="results/baselines/pruning_results.pt"
+    )
+    parser.add_argument(
+        "--agent_log",
         type=str,
-        default="results/baselines/pruning_results.pt",
-        help="Path to the baselines.py cache",
+        default=None,
+        help="Path to a .out log to parse instantly.",
     )
     parser.add_argument("--save_dir", type=str, default="./results")
     parser.add_argument("--batch_size", type=int, default=128)
