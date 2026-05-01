@@ -268,12 +268,8 @@ class HeadCensus:
                 )
 
         # Normalize across batches (excluding static Depth at index 3)
-        for idx in [0, 1, 2, 4, 5, 6, 7]:
+        for idx in [0, 1, 2, 4, 5, 6]:
             self.head_metrics[idx] /= num_batches
-
-        if hasattr(self.model, "get_taylor_importance"):
-            self.head_metrics[5] /= num_batches
-            self.head_metrics[6] /= num_batches
 
     def plot_results(self, task_name):
         metric_names = [
