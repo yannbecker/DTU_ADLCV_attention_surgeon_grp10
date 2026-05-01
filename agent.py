@@ -14,35 +14,74 @@ import torch.optim as optim
 from torch.distributions import Categorical
 import argparse
 import os
+import sys
 import re
 import numpy as np
 import matplotlib.pyplot as plt
 
-from classification import DinoClassifier, validate, get_loaders
-from rl_utils import get_flops_ratio, get_proxy_loader, FastProxyValidator
+# Task 1: Classification
+from classification import DinoClassifier
+from classification import get_loaders as get_loaders_cls
+
+# Task 2: Segmentation
+current_dir = os.path.dirname(os.path.abspath(__file__))
+sys.path.append(os.path.join(current_dir, "DPT_segmentation"))
+from segmentation import DinoSegmenter
+from segmentation import get_loaders as get_loaders_seg
+
+# Utils
+from rl_utils import (
+    get_flops_ratio,
+    get_proxy_loader,
+    FastProxyValidator,
+    FastProxyValidatorSeg,
+)
 from head_activation import HeadCensus
 
 # ----------------- ENVIRONMENT -----------------
 
 
 class PruningEnv:
-    def __init__(self, model, dataloader, device, max_pruning=72):
+    def __init__(
+        self, model, dataloader, device, task="classification", max_pruning=72
+    ):
         self.model = model
         self.device = device
         self.max_pruning = max_pruning  # Up to 72 heads
+        self.task = task
 
         self.num_heads = 144
         self.base_flops = self.num_heads  # Simplified proxy for FLOPs
 
-        self.proxy_loader = get_proxy_loader(dataloader, num_samples=500)
-        self.validator = FastProxyValidator(
-            model, self.proxy_loader, nn.CrossEntropyLoss(), device
-        )
+        # We store the full dataloader so we can resample from it
+        self.full_dataloader = dataloader
 
+        # 1. Initialize the proxy validator
+        self.resample_proxy()
+
+        # 2. Initialize the Micro-Census for fast spatial metrics
         self.micro_census_loader = get_proxy_loader(dataloader, num_samples=16, seed=99)
         self.census = HeadCensus(model, device)
 
         self.reset()
+
+    def resample_proxy(self):
+        """Dynamic Proxy Resampling. Draws a new 500-image subset."""
+        # Passing seed=None forces numpy to pull a completely random subset every time
+        self.proxy_loader = get_proxy_loader(
+            self.full_dataloader, num_samples=500, seed=None
+        )
+        if self.task == "segmentation":
+            self.validator = FastProxyValidatorSeg(
+                self.model,
+                self.proxy_loader,
+                nn.CrossEntropyLoss(ignore_index=-1),
+                self.device,
+            )
+        if self.task == "classification":
+            self.validator = FastProxyValidator(
+                self.model, self.proxy_loader, nn.CrossEntropyLoss(), self.device
+            )
 
     def reset(self):
         self.mask = torch.ones(self.num_heads).to(self.device)
@@ -71,7 +110,7 @@ class PruningEnv:
         return valid_mask
 
     def _get_state(self):
-        # Re-run the census on just 16 images - zero out old metrics and fill in new ones
+        # 1. Update Spatial Metrics
         self.census.head_metrics.zero_()
         for i in range(12):
             self.census.head_metrics[3, i, :] = (i + 1) / 12.0
@@ -85,7 +124,11 @@ class PruningEnv:
 
         # 2. Get Scalars
         flops_ratio = get_flops_ratio(self.mask)
-        scalars = torch.tensor([self.current_acc / 100.0, flops_ratio]).to(self.device)
+        # Time-Aware Critic (Progress scalar)
+        progress = self.steps / self.max_pruning
+        scalars = torch.tensor([self.current_acc / 100.0, flops_ratio, progress]).to(
+            self.device
+        )
 
         # 3. Get the Safeguard Mask
         safe_action_mask = self._get_valid_action_mask()
@@ -109,15 +152,25 @@ class PruningEnv:
 
         # # Calculate Reward: accuracy * (1 - (current FLOPs / base FLOPs))
         flops_ratio = get_flops_ratio(self.mask)
-        # reward = (new_acc / 100.0) * (1.0 - flops_ratio)
 
-        # Simple Delta-Accuracy Reward (FLOPS drop is constant per action, don't work if idle actions are possible)
-        reward = new_acc - self.current_acc
-        # Optional: Add a tiny survival bonus so the agent slightly prefers state stability
-        reward += 0.05
+        # Reward design: favorises "plateauing" and penalizes accuracy drops exponentially
+        delta = new_acc - self.current_acc
+
+        # 1. Exponential Penalty for dropping accuracy
+        if delta < 0:
+            step_reward = -(abs(delta) ** 1.5)
+        else:
+            # Sometimes pruning a noisy head actually increases accuracy slightly
+            step_reward = delta
+
+        # 2. Time-Scaled Survival Bonus
+        progress = self.steps / self.max_pruning
+        survival_bonus = 0.2 * progress  # Scales from 0.0 to +0.2 per step
+
+        reward = step_reward + survival_bonus
 
         print(
-            f"   -> Step {self.steps}: Pruned Head {action_idx} | New Acc: {new_acc:.2f}% | FLOPs Ratio: {flops_ratio:.4f} | Reward: {reward:.4f}"
+            f"   -> Step {self.steps}: Pruned Head {action_idx} | New Acc: {new_acc:.2f}% | Reward: {reward:.4f}"
         )
 
         self.current_acc = new_acc
@@ -225,8 +278,8 @@ class AdvancedActorCritic(nn.Module):
         self.vit = MiniViT(n_metrics=n_metrics, embed_dim=vit_embed_dim)
 
         # 2. Fusion Layer (ViT CLS token + Accuracy + FLOPs)
-        # Dimension: vit_embed_dim + 2 scalars
-        fused_dim = vit_embed_dim + 2
+        # Dimension: vit_embed_dim + 2 scalars + 1 progress scalar
+        fused_dim = vit_embed_dim + 3
 
         # Shared MLP for higher-level reasoning after fusion
         self.shared_mlp = nn.Sequential(
@@ -321,36 +374,53 @@ def train_ppo(args):
         args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu")
     )
 
-    # Parse the dataset name from the checkpoint filename (e.g., "dino_imagenet100_latest.pth")
-    filename = os.path.basename(args.checkpoint)
-    match = re.search(r"dino_(.*?)_(latest|epoch)", filename)
+    dataset_name = args.dataset
+    task = args.task
+    print(f"\n--- Initializing Task: {task.upper()} on {dataset_name.upper()} ---")
 
-    if match:
-        dataset_name = match.group(1)
-        print(f"[Auto-Detect] Extracted dataset '{dataset_name}' from checkpoint name.")
+    # Dynamically Load the Correct Task Architecture
+    if task == "segmentation":
+        # We MUST use features=False so the RGB images pass through the ViT for pruning evaluation
+        train_loader, val_loader = get_loaders_seg(
+            args.data_dir, args.batch_size, num_workers=2, use_features=False
+        )
+        model = DinoSegmenter(device, num_classes=150).to(device)
+
+    elif task == "classification":
+        train_loader, val_loader, num_classes = get_loaders_cls(
+            dataset_name, args.data_dir, args.batch_size, num_workers=2
+        )
+        model = DinoClassifier(device=device, num_classes=num_classes).to(device)
+
+    elif task == "detection":
+        raise NotImplementedError(
+            "Detection pipeline is not yet integrated into the RL environment."
+        )
     else:
-        # Fallback just in case the file was renamed manually
-        dataset_name = "imagenet100"
-        print(
-            f"[Warning] Could not auto-detect dataset from '{filename}'. Defaulting to '{dataset_name}'."
-        )
+        raise ValueError(f"Unknown task: {task}")
 
-    # Initialize Model and Data Loaders
-    _, val_loader, num_classes = get_loaders(
-        dataset_name, args.data_dir, args.batch_size, num_workers=2
-    )
-    model = DinoClassifier(device=device, num_classes=num_classes).to(device)
-
+    # Load Base Weights
     if os.path.exists(args.checkpoint):
-        model.load_state_dict(
-            torch.load(args.checkpoint, map_location=device)["model_state_dict"]
-        )
+        checkpoint_data = torch.load(args.checkpoint, map_location=device)
+        # Handle dict vs state_dict wrapping depending on how the task scripts saved it
+        if "model_state_dict" in checkpoint_data:
+            model.load_state_dict(checkpoint_data["model_state_dict"])
+        else:
+            model.load_state_dict(checkpoint_data)
+        print(f"[OK] Successfully loaded base weights from {args.checkpoint}")
+    else:
+        raise FileNotFoundError(f"Could not find checkpoint at {args.checkpoint}")
 
-    env = PruningEnv(model, val_loader, device, max_pruning=args.max_pruning)
+    if task == "segmentation":
+        model.transformer = model.pretrained.model
+
+    # Initialize Environment
+    env = PruningEnv(
+        model, train_loader, device, task=task, max_pruning=args.max_pruning
+    )
     policy = AdvancedActorCritic(n_metrics=7).to(device)
     optimizer = optim.Adam(policy.parameters(), lr=args.lr)
     eps_clip = 0.2
-    gamma = 0.99
 
     # Create save directory
     os.makedirs(args.save_dir, exist_ok=True)
@@ -362,7 +432,10 @@ def train_ppo(args):
     print("Starting PPO Training Loop...")
     for episode in range(args.episodes):
         print(f"\n--- Episode {episode+1}/{args.episodes} ---")
+        # Draw a completely new 500-image subset from the training set
+        env.resample_proxy()
         state_dict = env.reset()
+
         grids, scalars, masks, actions, log_probs, rewards, values = (
             [],
             [],
@@ -400,20 +473,28 @@ def train_ppo(args):
         total_return = sum(rewards)
         history["episodic_return"].append(total_return)
 
-        # 2. Compute Returns and Advantages
-        returns = []
-        discounted_reward = 0
-        for r in reversed(rewards):
-            discounted_reward = r + (gamma * discounted_reward)
-            returns.insert(0, discounted_reward)
+        # Generalized Advantage Estimation (GAE)
+        gamma = 0.99
+        gae_lambda = 0.95
+        advantages = []
+        gae = 0
 
-        returns = torch.tensor(returns, dtype=torch.float32).to(device)
-        values = torch.cat(values).squeeze()
-        advantages = returns - values.detach()
-        # Normalize advantages for stability
+        values_np = torch.cat(values).squeeze().detach().cpu().numpy()
+        values_np = np.append(values_np, 0.0)  # terminal state value
+
+        for t in reversed(range(len(rewards))):
+            delta = rewards[t] + gamma * values_np[t + 1] - values_np[t]
+            gae = delta + gamma * gae_lambda * gae
+            advantages.insert(0, gae)
+
+        advantages = torch.tensor(advantages, dtype=torch.float32).to(device)
+        values_tensor = torch.cat(values).squeeze().detach()
+        returns = advantages + values_tensor
+
+        # Normalize advantages
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
-        # 3. PPO Update Step
+        # PPO Update Step
         old_grids = torch.stack(grids)
         old_scalars = torch.stack(scalars)
         old_masks = torch.stack(masks)
@@ -435,7 +516,6 @@ def train_ppo(args):
             entropy = dist.entropy().mean()
 
             # Approximate KL Divergence: log(q/p) where q is new policy and p is old
-            # A common robust formula: mean((log_p_old - log_p_new) + (exp(log_p_new - log_p_old) - 1))
             log_ratio = new_log_probs - old_log_probs
             approx_kl = ((torch.exp(log_ratio) - 1) - log_ratio).mean()
 
@@ -470,7 +550,7 @@ def train_ppo(args):
         torch.save(
             policy.state_dict(),
             os.path.join(
-                args.save_dir, f"surgeon_ppo_latest_{args.max_pruning}prune.pth"
+                args.save_dir, f"surgeon_ppo_latest_{task}_{args.max_pruning}prune.pth"
             ),
         )
 
@@ -480,7 +560,8 @@ def train_ppo(args):
             torch.save(
                 policy.state_dict(),
                 os.path.join(
-                    args.save_dir, f"surgeon_ppo_best_{args.max_pruning}prune.pth"
+                    args.save_dir,
+                    f"surgeon_ppo_best_{task}_{args.max_pruning}prune.pth",
                 ),
             )
             print(f"   *** New Best Reward! ({best_reward:.4f}) ***")
@@ -500,6 +581,19 @@ def train_ppo(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="AttentionSurgeon RL Training")
     parser.add_argument(
+        "--task",
+        type=str,
+        required=True,
+        choices=["classification", "segmentation", "detection"],
+        help="The Computer Vision task to prune for.",
+    )
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        required=True,
+        help="The dataset name (e.g., imagenet100, ade20k, coco).",
+    )
+    parser.add_argument(
         "--checkpoint",
         type=str,
         required=True,
@@ -512,8 +606,8 @@ if __name__ == "__main__":
         default="./checkpoints_rl",
         help="Where to save RL agent weights",
     )
-    parser.add_argument("--episodes", type=int, default=100)
-    parser.add_argument("--max_pruning", type=int, default=72)
+    parser.add_argument("--episodes", type=int, default=200)
+    parser.add_argument("--max_pruning", type=int, default=50)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--device", type=str, default=None)
