@@ -210,18 +210,14 @@ def get_pruning_mask(importance: torch.Tensor, n_prune: int) -> torch.Tensor:
 
 def apply_mask(model: nn.Module, head_mask: torch.Tensor, task: str) -> None:
     device = next(model.parameters()).device
-    if task == "segmentation":
-        model.pretrained.model.mask = head_mask.float().to(device)
-    else:
-        model.mask = head_mask.float().to(device)
+    # Both DinoClassifier and DinoSegmenter read from model.mask
+    model.mask = head_mask.float().to(device)
 
 
 def reset_mask(model: nn.Module, task: str) -> None:
     device = next(model.parameters()).device
-    if task == "segmentation":
-        model.pretrained.model.mask = torch.ones(NUM_LAYERS, NUM_HEADS, device=device)
-    else:
-        model.mask = torch.ones(NUM_LAYERS, NUM_HEADS, device=device)
+    # Reset to all ones
+    model.mask = torch.ones(NUM_LAYERS, NUM_HEADS, device=device)
 
 
 # ── Evaluation ────────────────────────────────────────────────────────────────
