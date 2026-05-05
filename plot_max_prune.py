@@ -87,8 +87,9 @@ def evaluate_agent_trajectory(agent_path, x_vals, model, test_loader, device, ta
                 device
             )
             with torch.no_grad():
-                for images, labels in test_loader:
-                    images, labels = images.to(device), labels.to(device)
+                for batch in test_loader:
+                    # Safely extract regardless of tuple length
+                    images, labels = batch[0].to(device), batch[1].to(device)
                     labels[(labels < 0) | (labels >= 150)] = -100
                     _, outputs = model(images, features=False)
                     metric.update(outputs, labels)
